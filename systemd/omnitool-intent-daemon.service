@@ -1,0 +1,17 @@
+# Optional: the advisory intent classifier daemon (HTTP 127.0.0.1:8498).
+# Install: copy to ~/.config/systemd/user/, replace %h/omnitool with your checkout path if different,
+# then `systemctl --user daemon-reload && systemctl --user enable --now omnitool-intent-daemon`.
+[Unit]
+Description=omnitool intent/safety classifier daemon (advisory label, port 8498)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/omnitool
+Environment=OMNITOOL_DAEMON_TTL_SECONDS=86400000
+ExecStart=/usr/bin/python3 -u %h/omnitool/bin/omnitool_intent_daemon.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

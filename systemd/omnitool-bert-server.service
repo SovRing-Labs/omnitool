@@ -1,0 +1,17 @@
+# EXPERIMENTAL, off by default: the C++ interceptor socket (/tmp/omnitool_bert.sock).
+# classify_text() is not implemented and answers every request with an explicit error;
+# fleet-exec only probes the socket when FLEET_EXEC_BERT_SOCKET=1. Build it first (README "Build").
+[Unit]
+Description=omnitool BERT interceptor (experimental; /tmp/omnitool_bert.sock)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/omnitool
+Environment=LD_LIBRARY_PATH=%h/omnitool/third_party/onnxruntime/lib
+ExecStart=%h/omnitool/build/omnitool_bert_server
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

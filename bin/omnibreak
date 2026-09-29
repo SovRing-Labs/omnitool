@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+omnibreak — Circuit Breaker Database Initializer & CLI
+
+Creates omnibreak.db with circuit_breaker table and provides
+query/maintain subcommands for inspecting/resetting breaker state.
+
+Usage:
+  omnibreak init                              # create database (idempotent)
+  omnibreak status <hash_key>                 # lookup breaker state
+  omnibreak reset <hash_key>                  # reset a single key
+  omnibreak reset-all                         # wipe all entries
+  omnibreak stats                             # summary statistics
+  omnibreak list                              # list all tracked keys
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+DB_PATH = os.environ.get("OMNIBREAK_DB") or str(Path(__file__).resolve().parent / "omnibreak.db")  # release 0.1.0: env override
+
+
+def get_conn() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    return conn
+
+
+def cmd_init(args):
+    """Initialize the circuit breaker database."""
+    conn = get_conn()
+    conn.execute("""CREATE TABLE IF NOT EXISTS circuit_breaker (
+        hash_key     TEXT PRIMARY KEY,
+        fail_count   INTEGER NOT NULL DEFAULT 0,
+        last_result  TEXT,
+        first_seen   REAL NOT NULL,
+        last_seen    REAL NOT NULL,
+        blocked      INTEGER NOT NULL DEFAULT 0
+    )""")
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM circuit_breaker").fetchone()[0]
+    print(json.dumps({"ok": True, "path": DB_PATH, "entries": count}))
+    conn.close()
+
+
+def cmd_status(args):
+    """Look up a specific breaker entry by hash key."""
+    key = args.hash_key
+    if not key:
+        print(json.dumps({"ok": False, "error": "hash_key required"}))
+        sys.exit(1)
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM circuit_breaker WHERE hash_key=?", (key,)).fetchone()
+    conn.close()
+    if row is None:
+        print(json.dumps({"ok": True, "found": False, "hash_key": key}))
+        return
+    print(json.dumps({
+        "ok": True, "found": True,
+        "hash_key": key,
+        "fail_count": row[1],
+        "last_result": row[2],
+        "first_seen": row[3],
+        "last_seen": row[4],
+        "blocked": bool(row[5]),
+    }))
+
+
+def cmd_reset(args):
+    """Reset a single breaker entry."""
+    key = args.hash_key
+    if not key:
+        print(json.dumps({"ok": False, "error": "hash_key required"}))
+        sys.exit(1)
+    conn = get_conn()
+    conn.execute("DELETE FROM circuit_breaker WHERE hash_key=?", (key,))
+    conn.commit()
+    n = conn.total_changes
+    conn.close()
+    print(json.dumps({"ok": True, "deleted": n, "hash_key": key}))
+
+
+def cmd_reset_all(args):
+    """Wipe all breaker entries."""
+    conn = get_conn()
+    conn.execute("DELETE FROM circuit_breaker")
+    conn.commit()
+    n = conn.total_changes
+    conn.close()
+    print(json.dumps({"ok": True, "deleted": n}))
+
+
+def cmd_stats(args):
+    """Print summary statistics about the circuit breaker."""
+    conn = get_conn()
+    total = conn.execute("SELECT COUNT(*) FROM circuit_breaker").fetchone()[0]
+    warned = conn.execute("SELECT COUNT(*) FROM circuit_breaker WHERE fail_count >= 2").fetchone()[0]
+    tripped = conn.execute("SELECT COUNT(*) FROM circuit_breaker WHERE fail_count >= 3").fetchone()[0]
+    blocked = conn.execute("SELECT COUNT(*) FROM circuit_breaker WHERE blocked = 1").fetchone()[0]
+    
+    avg_count = 0
+    if total > 0:
+        avg_count = conn.execute("SELECT AVG(fail_count) FROM circuit_breaker").fetchone()[0] or 0
+    
+    max_row = conn.execute("SELECT hash_key, fail_count FROM circuit_breaker ORDER BY fail_count DESC LIMIT 1").fetchone()
+    oldest_row = conn.execute("SELECT hash_key, first_seen FROM circuit_breaker ORDER BY first_seen ASC LIMIT 1").fetchone()
+    
+    conn.close()
+    
+    print(json.dumps({
+        "ok": True,
+        "total_tracked": total,
+        "warning_threshold": warned,
+        "tripped_threshold": tripped,
+        "blocked": blocked,
+        "avg_fail_count": round(avg_count, 2),
+        "worst_hit": {"hash_key": max_row[0], "fail_count": max_row[1]} if max_row else None,
+        "oldest_entry": {"hash_key": oldest_row[0], "first_seen": oldest_row[1]} if oldest_row else None,
+    }))
+
+
+def cmd_list(args):
+    """List all tracked breaker keys with their status."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT hash_key, fail_count, last_seen FROM circuit_breaker ORDER BY fail_count DESC"
+    ).fetchall()
+    conn.close()
+    entries = []
+    for row in rows:
+        ts = row[2]
+        from datetime import datetime
+        try:
+            age_str = datetime.fromtimestamp(ts).isoformat()
+        except Exception:
+            age_str = str(ts)
+        threshold = ""
+        if row[1] >= 3:
+            threshold = "TRIPPED"
+        elif row[1] >= 2:
+            threshold = "WARNING"
+        entries.append({
+            "hash_key": row[0],
+            "fail_count": row[1],
+            "threshold": threshold,
+            "last_seen": age_str,
+        })
+    print(json.dumps({"ok": True, "total": len(entries), "entries": entries}, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OmniV2 Circuit Breaker — omnibreak.db management")
+    parser.add_argument("--db", type=str, default=None, help="Override database path")
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+
+    subparsers.add_parser("init", help="Create/reinitialize circuit_breaker table")
+    
+    status_p = subparsers.add_parser("status", help="Lookup breaker state for a key")
+    status_p.add_argument("hash_key", help="SHA256 hash key to look up")
+    
+    reset_p = subparsers.add_parser("reset", help="Reset a single breaker entry")
+    reset_p.add_argument("hash_key", help="Hash key to reset")
+    
+    subparsers.add_parser("reset-all", help="Wipe all breaker entries")
+    
+    subparsers.add_parser("stats", help="Summary statistics")
+    
+    subparsers.add_parser("list", help="List all tracked keys")
+
+    args = parser.parse_args()
+
+    if args.db:
+        global DB_PATH
+        DB_PATH = args.db
+
+    if args.command == "init":
+        cmd_init(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "reset":
+        cmd_reset(args)
+    elif args.command == "reset-all":
+        cmd_reset_all(args)
+    elif args.command == "stats":
+        cmd_stats(args)
+    elif args.command == "list":
+        cmd_list(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

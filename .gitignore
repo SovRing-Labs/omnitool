@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+node_modules/
+mcp/node_modules/
+bin/omnibreak.db
+db/
+control-center/
+.cache/
+# Not shipped; fetch/build per README "Build"
+third_party/
+bert_onnx/
+*.onnx
+*.onnx.data
+*.so
+*.so.*

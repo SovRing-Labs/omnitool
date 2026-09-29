@@ -1,0 +1,1604 @@
+#!/usr/bin/env python3
+"""
+fleet-exec -- Consolidated Omni-Tool Execution Engine with Parallel Pipelines
+
+Implements the 4-pillar Omni-Tool architecture:
+1. Parallel Subshell Pipelines: Concurrent non-blocking async execution.
+2. Semantic Diff Patching: Integrated patch application.
+3. State Caching & Incremental Hashing: SHA-256 cache-busting to skip redundant reads.
+4. Consolidated Omni-Tool Schema: Unified JSON interface for bash, read, write, patch, and sql.
+
+Streaming mode (--mode stream): emits Server-Sent Events (SSE) so models react mid-flight.
+Each operation result is streamed individually as an event; final results delivered at end.
+
+Semantic validation (--validate-semantic): pre-dispatch conflict detection before execution.
+
+USAGE:
+  fleet-exec '<json_payload>'                              # normal mode (default)
+  fleet-exec --file <payload.json>                          # from file
+  fleet-exec --mode stream '<json_payload>'                 # SSE streaming
+  cat payload.json | fleet-exec                             # stdin pipe
+  fleet-exec --validate-only '<json_payload>'               # validation only
+"""
+
+import asyncio
+import hashlib
+import json
+import os
+import random
+import sqlite3
+import sys
+import subprocess
+import sys
+import time
+import argparse
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
+import asyncio
+import json as _json_mod
+import shlex # FIX: Explicitly import shlex for Dispatch Doctor
+
+# Import sister tools. AI_STACK = the tool root (the directory above bin/); default bash cwd.
+AI_STACK = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(AI_STACK / "bin"))
+
+from fleet_sql import execute_omni_batch
+from fleet_patch import apply_patch
+from fleet_semantic_validate import analyze as _semantic_analyze
+from fleet_dependency_graph import DependencyGraph
+import omnitool_guard  # deterministic safety gate (2026-09-26; classifier is advisory only)
+from fleet_retry_engine import RetryPolicy, RetryConfig
+
+MAX_CONCURRENT_TASKS = 8
+DEFAULT_TIMEOUT_S = 30
+# 2026-09-26 dogfood: 4000 chars cut normal outputs (gate runs, listings); tunable, default 16000.
+STDOUT_CAP = int(os.environ.get("FLEET_EXEC_STDOUT_CAP", "16000"))
+MAX_READ_BYTES = 128 * 1024  # 128 KB safe read limit
+def compute_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# A2 (S2b 2026-09-25): write/patch targets must lie under a write scope.
+# Release 0.1.0: the default is the tool root and /tmp (the development tree listed its own home
+# directories here). Set FLEET_EXEC_WRITE_SCOPES=dir1:dir2 to name your project directories.
+_HOME = Path.home()
+_DEFAULT_WRITE_SCOPES = [AI_STACK, Path("/tmp")]
+
+
+def _write_scope_error(path_str: str) -> Optional[str]:
+    """None if path may be written; else a one-line refusal. Offramps: FLEET_EXEC_WRITE_ANYWHERE=1,
+    FLEET_EXEC_WRITE_SCOPES=<colon list> (replaces the default list)."""
+    if os.environ.get("FLEET_EXEC_WRITE_ANYWHERE") == "1":
+        return None
+    env_scopes = os.environ.get("FLEET_EXEC_WRITE_SCOPES")
+    scopes = [Path(x).expanduser() for x in env_scopes.split(":") if x] if env_scopes else _DEFAULT_WRITE_SCOPES
+    real = Path(os.path.realpath(Path(path_str).expanduser()))
+    for sc in scopes:
+        sc_real = Path(os.path.realpath(sc))
+        if real == sc_real or sc_real in real.parents:
+            return None
+    return f"path outside write scopes: {real} (allowed: {', '.join(str(s) for s in scopes)})"
+
+
+async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
+    cmd = args.get("command", "")
+    if isinstance(cmd, dict):
+        cmd = cmd.get("command") or cmd.get("cmd") or ""
+    if not cmd:
+        return {"ok": False, "error": "command required"}
+
+    cwd_early = args.get("cwd") or str(AI_STACK)
+
+    if args.get("detach"):
+        # Fire-and-forget: the outer MCP transport (Node execFileAsync) hard-
+        # times-out at 60s regardless of timeout_s, and asyncio.wait_for on
+        # proc.communicate() below blocks until stdout/stderr pipes close --
+        # both wrong for a daemon. detach spawns via sync Popen with stdin
+        # closed (non-interactive opencode invocations hang reading an open
+        # stdin pipe -- see bin/lane-verify's identical bug), output
+        # redirected to a log file, and returns immediately without waiting.
+        log_path = args.get("log_path") or f"/tmp/fleet-exec-detach-{int(time.time()*1000)}.log"
+        try:
+            logf = open(log_path, "ab")
+            proc = subprocess.Popen(
+                cmd, shell=True, executable="/bin/bash", cwd=cwd_early,
+                stdin=subprocess.DEVNULL,
+                stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            logf.close()
+            return {"ok": True, "detached": True, "pid": proc.pid, "log_path": log_path}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # Models can explicitly request stdout capture even on success
+    want_capture = args.get("capture_stdout", False)
+
+    if args.get("on_timeout") == "detach":
+        # Auto-promote to background instead of killing: runs like a normal
+        # bash op (waited on, full result returned) UNLESS it's still going
+        # at timeout_s, in which case it is left running (never killed) and
+        # a {status: still_running, pid, log_path} handle is returned so the
+        # caller never blocks past its own budget.
+        log_path = args.get("log_path") or f"/tmp/fleet-exec-detach-{int(time.time()*1000)}.log"
+        try:
+            logf = open(log_path, "ab")
+            proc2 = subprocess.Popen(
+                cmd, shell=True, executable="/bin/bash", cwd=cwd_early,
+                stdin=subprocess.DEVNULL,
+                stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            logf.close()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        start2 = time.time()
+        poll_s = 0.005  # S2b: back off 5ms -> 250ms (was a flat 250ms floor on every bash op)
+        while True:
+            ret = proc2.poll()
+            elapsed = time.time() - start2
+            if ret is not None:
+                duration_ms = round(elapsed * 1000, 2)
+                result2: Dict[str, Any] = {"ok": ret == 0, "exit_code": ret, "duration_ms": duration_ms, "log_path": log_path}
+                try:
+                    out_text2 = open(log_path, "r", encoding="utf-8", errors="replace").read()
+                except Exception:
+                    out_text2 = ""
+                if out_text2:
+                    result2["stdout"] = out_text2[:STDOUT_CAP]
+                    result2["truncated"] = len(out_text2) > STDOUT_CAP
+                # Auto-promoted op finished inside its budget: output is inline, the log is litter.
+                if args.get("_auto_detach") and not args.get("log_path") and not result2.get("truncated"):
+                    try:
+                        os.unlink(log_path)
+                        result2.pop("log_path", None)
+                    except OSError:
+                        pass
+                return result2
+            if elapsed >= timeout_s:
+                return {
+                    "ok": True, "status": "still_running", "pid": proc2.pid,
+                    "log_path": log_path, "elapsed_s": round(elapsed, 1),
+                    "note": f"exceeded {timeout_s}s, left running in background — poll log_path or re-check pid to see if it finished",
+                }
+            await asyncio.sleep(poll_s)
+            poll_s = min(poll_s * 2, 0.25)
+
+    cwd = cwd_early
+    start = time.time()
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            executable="/bin/bash",   # 2026-09-26 dogfood: was /bin/sh; bash-only syntax needed a Doctor re-run
+        )
+        stdout_raw, stderr_raw = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        duration_ms = round((time.time() - start) * 1000, 2)
+        out_text = stdout_raw.decode("utf-8", errors="replace")
+        err_text = stderr_raw.decode("utf-8", errors="replace")
+
+        ok = proc.returncode == 0
+        result: Dict[str, Any] = {"ok": ok, "exit_code": proc.returncode, "duration_ms": duration_ms}
+
+        if not ok:
+            # Failure: always return full output for debugging
+            result["stdout"] = out_text[:STDOUT_CAP]
+            result["stderr"] = err_text[:2000] if err_text else None
+            result["truncated"] = len(stdout_raw) > STDOUT_CAP
+        else:
+            if out_text:
+                result["stdout"] = out_text[:STDOUT_CAP]
+                result["truncated"] = len(stdout_raw) > STDOUT_CAP
+            if err_text:
+                result["stderr"] = err_text[:2000]
+
+        return result
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"Command timed out after {timeout_s}s", "exit_code": -1, "duration_ms": round((time.time() - start) * 1000, 2)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "duration_ms": round((time.time() - start) * 1000, 2)}
+
+
+async def op_read(args: Dict[str, Any]) -> Dict[str, Any]:
+    path_str = args.get("path", "")
+    if not path_str:
+        return {"ok": False, "error": "path required"}
+
+    p = Path(path_str).expanduser().resolve()
+    if not p.exists():
+        return {"ok": False, "error": f"File not found: {p}"}
+
+    start = time.time()
+    try:
+        raw_bytes = p.read_bytes()
+        mtime_ns = p.stat().st_mtime_ns
+        file_hash = compute_sha256(raw_bytes)
+
+        # Client-supplied cache hash
+        client_hash = args.get("cache_hash") or args.get("hash")
+        if client_hash and client_hash == file_hash:
+            return {
+                "ok": True, "path": str(p), "cached": True,
+                "sha256": file_hash, "bytes": len(raw_bytes), "duration_ms": round((time.time() - start) * 1000, 2)
+            }
+
+        truncated = len(raw_bytes) > MAX_READ_BYTES
+        view_bytes = raw_bytes[:MAX_READ_BYTES]
+        text_content = view_bytes.decode("utf-8", errors="replace")
+
+
+        return {
+            "ok": True, "path": str(p),
+            "status": "modified" if client_hash else "read",
+            "sha256": file_hash, "bytes": len(raw_bytes),
+            "truncated": truncated, "content": text_content,
+            "duration_ms": round((time.time() - start) * 1000, 2)
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def op_write(args: Dict[str, Any]) -> Dict[str, Any]:
+    path_str = args.get("path", "")
+    content = args.get("content", "")
+    if not path_str:
+        return {"ok": False, "error": "path required"}
+
+    scope_err = _write_scope_error(path_str)
+    if scope_err:
+        return {"ok": False, "error": scope_err}
+    p = Path(path_str).expanduser().resolve()
+    start = time.time()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, (dict, list)):
+            content = json.dumps(content, indent=2)
+        text_data = str(content)
+        p.write_text(text_data, encoding="utf-8")
+        file_hash = compute_sha256(text_data.encode("utf-8"))
+
+        # F3: post-write formatter — opt-in per op (A3, S2b): default writes exactly the requested bytes
+        try:
+            fmt_result = await _auto_format_after_write(str(p)) if args.get("format") else {}
+            if fmt_result.get("formatted"):
+                file_hash = compute_sha256(p.read_text(encoding="utf-8").encode("utf-8"))  # re-hash after format
+        except Exception:
+            pass  # Never let formatter fail a write
+
+        return {
+            "ok": True,
+            "path": str(p),
+            "bytes_written": len(text_data),
+            "sha256": file_hash,
+            "duration_ms": round((time.time() - start) * 1000, 2)
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ── Sub-second fault diagnostic extraction (F2) ──────────────────────
+def _extract_diagnostics(op_type: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse raw stderr/stdout from failed ops into structured JSON diagnostics.
+    
+    Returns compact dict with failing_file, line, error type, suggested action.
+    Injected into result._diagnostics for MCP client rendering.
+    """
+    if not isinstance(result.get("stderr"), str):
+        return {}
+    err_text = result["stderr"][:3000]  # cap for parsing
+    
+    import re
+    diagnostics: Dict[str, Any] = {}
+    
+    # Python traceback → extract module/file/line
+    tb_match = re.search(r'File "([^"]+)", line (\d+), in [^\n]+\n\s*(\w.*)', err_text)
+    if tb_match:
+        diagnostics["failing_file"] = tb_match.group(1)
+        diagnostics["line"] = int(tb_match.group(2))
+        diagnostics["status"] = "REJECTED_BY_GATE"
+        diagnostics["action_required"] = f"Fix syntax/logic at {tb_match.group(1)}:{tb_match.group(2)} — {tb_match.group(3)[:120]}"
+        return diagnostics
+    
+    # Rust compiler error → extract source file + span
+    rust_span = re.search(r'Source file: ([^"\n]+)', err_text)
+    if rust_span:
+        diagnostics["failing_file"] = rust_span.group(1)
+        diagnostics["status"] = "REJECTED_BY_GATE"
+        diagnostics["action_required"] = "Check Rust compilation errors above. Fix type/syntax issues reported by cargo."
+        diagnostics["error_category"] = "rust_compile"
+        return diagnostics
+    
+    # Svelte/compiler error → component + line
+    svelte_err = re.search(r'(?i)([^"\s]*\.svelte)[\s:]+([0-9]+):([0-9]+)', err_text)
+    if svelte_err:
+        diagnostics["failing_file"] = svelte_err.group(1)
+        diagnostics["line"] = int(svelte_err.group(2))
+        diagnostics["column"] = int(svelte_err.group(3))
+        diagnostics["status"] = "REJECTED_BY_GATE"
+        diagnostics["action_required"] = f"Check {svelte_err.group(1)} around line {svelte_err.group(2)}, column {svelte_err.group(3)}"
+        return diagnostics
+    
+    # General heuristic: look for common failure patterns
+    if "SyntaxError" in err_text or "IndentationError" in err_text:
+        diagnostics["status"] = "REJECTED_BY_GATE"
+        diagnostics["error_category"] = "python_syntax"
+        lines = err_text.strip().split('\n')
+        for line in lines[-5:]:
+            m = re.search(r'line (\d+)', line)
+            if m:
+                diagnostics["line"] = int(m.group(1))
+                break
+    
+    if diagnostics:
+        return diagnostics
+    
+    return {}
+
+
+# ── Post-write auto-formatter (F3) ────────────────────────────────
+async def _auto_format_after_write(path_str: str) -> Dict[str, Any]:
+    """Auto-run language-specific formatters after a successful write.
+    
+    Non-blocking best-effort — never raises. Logs formatted=false on failure.
+    Known formatters: python→ruff, typescript→prettier, go→gofmt, svelte→svelte-check
+    """
+    ext = Path(path_str).suffix.lower()
+    formatter_cmds = {
+        ".py": ["ruff", "format", path_str],
+        ".js": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".ts": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".jsx": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".tsx": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".css": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".html": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".json": ["npx", "--no-install", "prettier", "--write", path_str],
+        ".go": ["gofmt", "-w", path_str],
+    }
+    cmd = formatter_cmds.get(ext)
+    if not cmd:
+        return {}
+    try:
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE),
+            timeout=10
+        )
+        _, stderr = await proc.communicate()
+        return {"formatted": proc.returncode == 0, "formatter": cmd[0], "_silent": True}
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return {}  # Formatter not installed → silent skip
+
+
+async def op_patch(args: Dict[str, Any]) -> Dict[str, Any]:
+    diff = args.get("diff", "")
+    target = args.get("target")
+    dry_run = args.get("dry_run", False)
+    if not diff:
+        return {"ok": False, "error": "diff required", "type": "patch"}
+
+    if not dry_run:
+        from fleet_patch import extract_target_paths
+        for cand in ([target] if target else extract_target_paths(diff)):
+            cp = Path(cand).expanduser()
+            scope_err = _write_scope_error(str(cp if cp.is_absolute() else AI_STACK / cp))
+            if scope_err:
+                return {"ok": False, "error": scope_err, "type": "patch"}
+
+    res = apply_patch(diff_text=diff, target=target, dry_run=dry_run)
+    
+    # Ensure type field is present for capsule injection
+    if isinstance(res, dict):
+        res.setdefault("type", "patch")
+    
+    return res
+
+
+async def op_fix_json(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Fix common JSON syntax errors in a file and write back corrected version.
+    
+    Handles: trailing commas, unquoted keys, single quotes, // comments, /* */ comments,
+    missing braces/brackets, and common formatting issues.
+    """
+    import re
+    
+    path = args.get("path")
+    if not path:
+        return {"ok": False, "error": "path required"}
+    scope_err = _write_scope_error(path)
+    if scope_err:
+        return {"ok": False, "error": scope_err}
+
+    path = Path(path).resolve()
+    if not path.exists():
+        return {"ok": False, "error": f"File not found: {path}"}
+    
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return {"ok": False, "error": f"Read failed: {e}"}
+    
+    original = content
+    fixes_applied = []
+    
+    # 1. Strip // line comments
+    if "//" in content:
+        lines = content.split("\n")
+        cleaned = []
+        for line in lines:
+            in_string = False
+            escape = False
+            comment_pos = -1
+            for i, ch in enumerate(line):
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"' and not escape:
+                    in_string = not in_string
+                elif ch == "/" and i + 1 < len(line) and line[i+1] == "/" and not in_string:
+                    comment_pos = i
+                    break
+            if comment_pos >= 0:
+                line = line[:comment_pos].rstrip()
+                fixes_applied.append("stripped // comment")
+            cleaned.append(line)
+        content = "\n".join(cleaned)
+    
+    # 2. Strip /* */ block comments
+    if "/*" in content and "*/" in content:
+        content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+        fixes_applied.append("stripped /* */ comments")
+    
+    # 3. Fix trailing commas in objects and arrays
+    new_content = re.sub(r",\s*([}\]])", r"\1", content)
+    if new_content != content:
+        fixes_applied.append("removed trailing commas")
+        content = new_content
+    
+    # 4. Fix unquoted keys
+    def quote_keys(match):
+        prefix = match.group(1)
+        key = match.group(2)
+        return f'{prefix}"{key}":'
+    
+    new_content = re.sub(r'([{\[,]\s*)([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:', quote_keys, content)
+    if new_content != content:
+        fixes_applied.append("quoted unquoted keys")
+        content = new_content
+    
+    # 5. Fix single-quoted strings to double-quoted
+    def fix_single_quotes(match):
+        inner = match.group(1)
+        inner = re.sub(r'(?<!\\)"', '\\"', inner)
+        return f'"{inner}"'
+    
+    new_content = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", fix_single_quotes, content)
+    if new_content != content:
+        fixes_applied.append("converted single-quoted strings")
+        content = new_content
+    
+    # 6. Try to parse; if still failing, attempt more aggressive fixes
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        open_braces = content.count("{")
+        close_braces = content.count("}")
+        open_brackets = content.count("[")
+        close_brackets = content.count("]")
+        
+        if open_braces > close_braces:
+            content += "}" * (open_braces - close_braces)
+            fixes_applied.append(f"added {open_braces - close_braces} closing braces")
+        if open_brackets > close_brackets:
+            content += "]" * (open_brackets - close_brackets)
+            fixes_applied.append(f"added {open_brackets - close_brackets} closing brackets")
+        
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as e2:
+            return {
+                "ok": False,
+                "error": f"JSON still invalid after fixes: {e2}",
+                "_original_error": str(e),
+                "_fixes_attempted": fixes_applied,
+                "_position": e2.pos
+            }
+    
+    # Write back fixed content (pretty-printed)
+    try:
+        fixed_content = json.dumps(parsed, indent=2, ensure_ascii=False)
+        path.write_text(fixed_content + "\n", encoding="utf-8")
+    except Exception as e:
+        return {"ok": False, "error": f"Write failed: {e}"}
+    
+    return {
+        "ok": True,
+        "path": str(path),
+        "fixes_applied": fixes_applied if fixes_applied else ["already valid JSON"],
+        "bytes_before": len(original),
+        "bytes_after": len(fixed_content),
+        "parsed_keys": list(parsed.keys()) if isinstance(parsed, dict) else (len(parsed) if isinstance(parsed, list) else type(parsed).__name__)
+    }
+
+
+async def op_glob(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Find files by glob (2026-09-26: small models reach for glob/grep op types; they were
+    rejected as unknown). Read-only; skips .git/node_modules/__pycache__; max 500 paths."""
+    start = time.time()
+    base = Path(os.path.expanduser(str(args.get("path") or "."))).resolve()
+    if not base.is_dir():
+        return {"ok": False, "error": f"directory not found: {base}"}
+    limit = min(int(args.get("limit") or 200), 500)
+    files: List[str] = []
+    for f in base.glob(str(args.get("pattern") or "*")):
+        if f.is_file() and not any(x in (".git", "node_modules", "__pycache__") for x in f.parts):
+            files.append(str(f))
+            if len(files) >= limit:
+                break
+    return {"ok": True, "count": len(files), "files": files, "truncated": len(files) >= limit,
+            "duration_ms": round((time.time() - start) * 1000, 2)}
+
+
+async def op_grep(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Regex search via ripgrep (grep -rn fallback). Read-only; max 300 matching lines."""
+    start = time.time()
+    target = str(Path(os.path.expanduser(str(args.get("path") or "."))))
+    limit = min(int(args.get("limit") or 100), 300)
+    cmd = ["rg", "-n", "--max-count", "50", "--max-columns", "300"]
+    if args.get("ignore_case"):
+        cmd.append("-i")
+    if args.get("glob"):
+        cmd += ["-g", str(args["glob"])]
+    cmd += ["--", str(args.get("pattern", "")), target]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except FileNotFoundError:
+        cmd = ["grep", "-rn", "-m", "50"] + (["-i"] if args.get("ignore_case") else []) + ["--", str(args.get("pattern", "")), target]
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    if proc.returncode not in (0, 1):
+        return {"ok": False, "error": err.decode(errors="replace")[:300], "exit_code": proc.returncode}
+    lines = out.decode(errors="replace").splitlines()
+    return {"ok": True, "count": len(lines), "matches": lines[:limit], "truncated": len(lines) > limit,
+            "duration_ms": round((time.time() - start) * 1000, 2)}
+
+
+async def op_sql(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute SQL batch via execute_omni_batch in a worker thread."""
+    try:
+        res = await asyncio.to_thread(execute_omni_batch, payload)
+        return res
+    except Exception as e:
+        return {"ok": False, "error": f"SQL execution failed: {e}", "type": "sql"}
+
+
+ALLOWED_OP_TYPES = ("bash", "read", "write", "patch", "sql", "db_exec", "omni_sql", "fix_json", "glob", "grep")
+# (field, expected python types) — checked only when the field is present-required;
+# a missing required field is its own error, reported once per operation.
+REQUIRED_ARGS = {
+    "bash": [("command", str)],
+    "read": [("path", str)],
+    "write": [("path", str)],
+    "patch": [("diff", str)],
+    # sql family: `database` is optional — dispatch defaults it to "dispatch" (DL-omnitool-17).
+    # Requiring it here (S2b 2026-09-25) silently regressed that default for small models.
+    "fix_json": [("path", str)],
+    "glob": [("pattern", str)],
+    "grep": [("pattern", str)],
+}
+
+
+def validate_payload(payload: Dict[str, Any]) -> List[str]:
+    """Structural validation collecting every violation at once.
+    Errors are compact machine-parseable strings — models correct faster with less token waste."""
+    errors: List[str] = []
+    if not isinstance(payload, dict):
+        return [f"root: expected object, got {type(payload).__name__}"]
+
+    operations = payload.get("operations")
+    if operations is None:
+        operations = payload.get("tasks")
+    if operations is None:
+        return ["payload: missing 'operations' (or 'tasks') array"]
+    if not isinstance(operations, list):
+        return [f"'operations': must be array, got {type(operations).__name__}"]
+    if not operations:
+        return ["'operations': empty — no work specified"]
+
+    concurrency = payload.get("concurrency", "parallel")
+    if concurrency not in ("parallel", "sequential", "auto"):
+        errors.append(f"'concurrency': invalid value {concurrency!r}")
+
+    for idx, op in enumerate(operations):
+        if not isinstance(op, dict):
+            errors.append(f"op[{idx}]: expected object, got {type(op).__name__}")
+            continue
+        op_type = op.get("type") or op.get("tool")
+        if not op_type:
+            errors.append(f"op[{idx}]: missing 'type'")
+            continue
+        if op_type not in ALLOWED_OP_TYPES:
+            hint = ""
+            if "git" in str(op_type):
+                hint = " (did you mean 'patch' for diff-based file edits?)"
+            elif "copy" in str(op_type) or "move" in str(op_type):
+                hint = " (use 'bash' with cp/mv commands)"
+            elif "query" in str(op_type) or "sql" in str(op_type).lower():
+                hint = " (use type='sql' with database field)"
+            errors.append(f"op[{idx}]: unknown type '{op_type}' — valid: {', '.join(ALLOWED_OP_TYPES)}{hint}")
+            continue
+        for field, _ in REQUIRED_ARGS.get(op_type, []):
+            if field not in op:
+                errors.append(f"op[{idx}]: missing '{field}'")
+        if op_type == "write" and "content" not in op:
+            errors.append(f"op[{idx}]: missing 'content'")
+        if op_type in ("sql", "db_exec", "omni_sql"):
+            sql_ops = op.get("operations") or op.get("queries")
+            if sql_ops is not None and not isinstance(sql_ops, list):
+                errors.append(f"op[{idx}]: 'queries' must be array")
+    return errors
+
+
+
+# ── Omnitool Dispatch Doctor (F1) ──────────────────────────────────
+def _doctor_diagnose_and_fix(op: Dict[str, Any], result: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Diagnose common bash errors and return a corrected operation or None.
+    
+    Fixes:
+    1. Unescaped quotes leading to Exit Code 127 ('command not found').
+    2. General shell syntax errors (unmatched quotes, etc.).
+    """
+    
+    op_type = op.get("type") or op.get("tool") or op.get("op")
+    if op_type != "bash" or result.get("ok", True):
+        return op, None 
+    
+    cmd = op.get("command", "")
+    stderr = result.get("stderr", "")
+    exit_code = result.get("exit_code")
+
+    new_command = None
+    fix_category = None
+
+    # S2b 2026-09-25: only re-run when the shell REJECTED the command at parse time on a
+    # single-line command (nothing executed). The old trigger (any exit 1/2/127) re-ran
+    # commands that had already run, so non-idempotent work (appends, inserts, POSTs) ran twice.
+    # auto-detached ops merge stderr into the log, so the shell's parse error lands in stdout
+    err_l = ((stderr or "") + "\n" + (result.get("stdout") or "")).lower()
+    import re as _re
+    parse_error = bool(_re.search(
+        r"(^|\n)(/bin/|/usr/bin/)?(ba|da)?sh: (-c: )?(line )?\d+: .*(syntax error|unexpected eof|unmatched|unterminated)",
+        err_l))
+    if "\n" in cmd.strip() or not parse_error:
+        return op, None
+
+    # 1. Exit Code 127: Command Not Found (often results from bad quoting)
+    if exit_code == 127 and "not found" in stderr.lower():
+        import shlex
+        try:
+            tokens = shlex.split(cmd)
+            # Re-joining ensures proper quoting for elements that need it
+            escaped_cmd = shlex.join(tokens)
+            if escaped_cmd != cmd:
+                new_command = escaped_cmd
+                fix_category = "quotes_127_shlex"
+        except ValueError:
+            # If shlex.split failed (unmatched quotes), try aggressive wrap.
+            # Replace common shell interpolation characters to prevent unintended expansion.
+            safe_cmd = cmd.replace("$", "\\$").replace("`", "\\`")
+            new_command = f'bash -c "{safe_cmd}"'
+            fix_category = "aggressive_wrap_127"
+    
+    # 2. General shell syntax errors (Exit Code 1/2, explicit quote errors)
+    if not new_command and (
+        "unmatched quote" in stderr.lower()
+        or "syntax error" in stderr.lower()
+        or "unterminated" in stderr.lower()
+        or "unexpected eof" in stderr.lower()
+        or exit_code in (1, 2, 127)
+    ):
+        # 09-29 (J): an apostrophe inside a word (it's) is the usual culprit. Closing the quote at the
+        # end "worked" but changed meaning (`echo it's fine` printed `its fine`), so repair the
+        # apostrophe itself first: '\'' when it sits inside a single-quoted string, \' outside one.
+        # A candidate is used only if `bash -n` parses it; otherwise fall through to the old rules.
+        intra = _re.compile(r"(?<=[A-Za-z0-9])'(?=[A-Za-z])")
+        if cmd.count("'") % 2 != 0 and intra.search(cmd):
+            import subprocess as _sp
+            for repl, cat in (("'\\''", "escape_apostrophe_in_quotes"), ("\\'", "escape_apostrophe")):
+                cand = intra.sub(repl, cmd)
+                try:
+                    if _sp.run(["bash", "-n", "-c", cand], capture_output=True, timeout=5).returncode == 0:
+                        new_command, fix_category = cand, cat
+                        break
+                except Exception:
+                    break
+        if new_command:
+            pass
+        elif cmd.count("'") % 2 != 0:
+            if cmd.endswith("'"):
+                new_command = cmd[:-1]
+                fix_category = "strip_trailing_quote"
+            else:
+                new_command = cmd + "'"
+                fix_category = "close_trailing_quote"
+        elif cmd.count('"') % 2 != 0:
+            if cmd.endswith('"'):
+                new_command = cmd[:-1]
+                fix_category = "strip_trailing_double_quote"
+            else:
+                new_command = cmd + '"'
+                fix_category = "close_trailing_double_quote"
+        else:
+            safe_cmd = cmd.replace("$", "\\$").replace("`", "\\`")
+            new_command = f'bash -c "{safe_cmd}"'
+            fix_category = "syntax_wrap_bash_c"
+
+
+    if new_command and new_command != cmd:
+        new_op = op.copy()
+        new_op["command"] = new_command
+        # Mark as doctored so it doesn't get doctored again if it fails its second run
+        new_op["_doctor_attempted"] = True
+        return new_op, fix_category
+
+    return op, None
+
+
+# ── Auto-retry helpers (wired from fleet_retry_engine import) ─────────────
+
+_RETRYABLE_PATTERNS = [
+    (lambda e: "timed out" in str(e).lower(),          "timeout"),
+    (lambda e: "busy" in str(e).lower() or "locked" in str(e).lower(), "database_locked"),
+    (lambda e: "connection refused" in str(e).lower(),  "connection_refused"),
+]
+
+
+def _is_retryable(op_type: str, err_text: str) -> Tuple[bool, str]:
+    """Return (True, category) if this failure should auto-retry."""
+    msg = err_text.lower()
+    if op_type == "sql":
+        # DB lock/busy → always retry (file handles get stale during heavy I/O)
+        if "locked" in msg or "busy" in msg:
+            return True, "database_locked"
+    for matcher, cat in _RETRYABLE_PATTERNS:
+        if matcher(Exception(err_text)):
+            return True, cat
+    return False, ""
+
+
+def _compute_delay(attempt: int, category: str) -> float:
+    """Exponential backoff + jitter per failure class."""
+    base = 0.5 if category == "database_locked" else 1.0
+    delay = base * (2 ** attempt)
+    jitter = random.uniform(0, delay * 0.3)
+    return min(delay + jitter, 15.0)
+
+
+# ── Omnibreak circuit-breaker wiring (F5) ────────────────────────────
+_OMNIBREAK_DB = os.environ.get("OMNIBREAK_DB") or str(Path(__file__).resolve().parent / "omnibreak.db")  # release 0.1.0: env override
+_BREAK_WARN = 2   # warn after this many consecutive fails for same key
+_BREAK_TRIP = 3   # abort/trigger breaker at this count
+
+def _omnibreak_init():
+    """Ensure circuit_breaker table exists."""
+    try:
+        conn = sqlite3.connect(_OMNIBREAK_DB)
+        conn.execute("""CREATE TABLE IF NOT EXISTS circuit_breaker (
+            hash_key     TEXT PRIMARY KEY,
+            fail_count   INTEGER NOT NULL DEFAULT 0,
+            last_result  TEXT,
+            first_seen   REAL NOT NULL,
+            last_seen    REAL NOT NULL,
+            blocked      INTEGER NOT NULL DEFAULT 0
+        )""")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # Best-effort; DB may be read-only
+
+
+def _omnibreak_check(op_type: str, op_hash: str) -> Dict[str, Any]:
+    """Pre-flight check: returns {'abort': True, 'reason': ...} if breaker tripped."""
+    try:
+        conn = sqlite3.connect(f"file:{_OMNIBREAK_DB}?mode=ro", uri=True, timeout=1)
+        row = conn.execute(
+            "SELECT fail_count, blocked FROM circuit_breaker WHERE hash_key=?",
+            (op_hash,),
+        ).fetchone()
+        conn.close()
+        if row and row[1]:  # blocked == 1
+            return {"abort": True, "reason": f"circuit_breaker_blocked_{row[0]}"}
+        return {"abort": False}
+    except Exception:
+        return {"abort": False}  # Never block on best-effort
+
+
+def _omnibreak_record(op_type: str, op_hash: str, ok: bool, err_text: str = "") -> None:
+    """Record operation result to omnibreak. Tracks repeat offenders."""
+    try:
+        conn = sqlite3.connect(f"file:{_OMNIBREAK_DB}?mode=rwc", uri=True, timeout=2)
+        now = time.time()
+        existing = conn.execute(
+            "SELECT fail_count, last_seen, blocked FROM circuit_breaker WHERE hash_key=?",
+            (op_hash,),
+        ).fetchone()
+        
+        if existing:
+            fc = existing[0]
+            blocked = existing[2]
+            if ok:
+                # Success resets counter (different op with same hash succeeded)
+                if fc > 0:
+                    conn.execute(
+                        "UPDATE circuit_breaker SET fail_count=0, last_result=?, last_seen=? WHERE hash_key=?",
+                        ("success_reset", now, op_hash),
+                    )
+            else:
+                fc += 1
+                new_blocked = 1 if fc >= _BREAK_TRIP else blocked
+                if new_blocked != blocked:
+                    conn.execute(
+                        "UPDATE circuit_breaker SET fail_count=?, last_result=?, last_seen=?, blocked=? WHERE hash_key=?",
+                        (fc, err_text[:500], now, new_blocked, op_hash),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE circuit_breaker SET fail_count=?, last_result=?, last_seen=? WHERE hash_key=?",
+                        (fc, err_text[:500], now, op_hash),
+                    )
+        else:
+            fc = 1 if not ok else 0
+            blocked = 1 if fc >= _BREAK_TRIP else 0
+            conn.execute(
+                "INSERT INTO circuit_breaker (hash_key, fail_count, last_result, first_seen, last_seen, blocked) VALUES (?, ?, ?, ?, ?, ?)",
+                (op_hash, fc, err_text[:500] if err_text else "", now, now, blocked),
+            )
+        
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # Best-effort
+
+
+def _make_op_hash(op: Dict[str, Any]) -> str:
+    """Create a stable hash for an operation — used for circuit-breaker dedup."""
+    op_type = op.get("type") or op.get("tool", "?")
+    # Normalize: strip variable parts (command strings, file paths may change)
+    key_parts = [op_type]
+    if op_type == "bash":
+        # Hash the command without timing/environment noise
+        cmd = op.get("command", "")[:100]
+        key_parts.append(cmd.strip())
+    elif op_type == "read":
+        key_parts.append(op.get("path", "")[:80])
+    elif op_type in ("write", "patch"):
+        target = op.get("path") or op.get("target") or ""
+        key_parts.append(target[:80])
+    elif op_type in ("sql", "db_exec", "omni_sql"):
+        key_parts.append(op.get("database", "")[:40])
+        # 2026-09-26: include the statement, so one failing query cannot trip the breaker for every query on the db
+        key_parts.append(str(op.get("sql") or op.get("query") or op.get("queries") or "")[:200])
+    raw = "|".join(key_parts).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def dispatch_single(op: Dict[str, Any], default_timeout: float = DEFAULT_TIMEOUT_S) -> Dict[str, Any]:
+    """Execute a single operation with diagnostics, circuit-breaker, and retries."""
+    op_type = op.get("type") or op.get("tool")
+    # 2026-09-26 dogfood (TOOL-9 regression): the MCP schema documents a per-op `timeout_ms`, but
+    # only `timeout_s` was read, so every op silently got the 30 s default.
+    if "timeout_s" not in op and op.get("timeout_ms") is not None:
+        try:
+            op = {**op, "timeout_s": float(op["timeout_ms"]) / 1000.0}
+        except (TypeError, ValueError):
+            pass
+    timeout = float(op.get("timeout_s", default_timeout))
+    max_retries = int(op.get("_max_retries", 2))
+    
+    # F5: Generate stable hash for circuit-breaker tracking
+    op_hash = _make_op_hash(op)
+    
+    async def _execute():
+        if op_type == "bash":
+            local_op = dict(op)
+            # Auto-detach is the safety net for EVERY bash op without an explicit detach/on_timeout;
+            # an explicit timeout now sets its budget (was: any timeout_s disabled the net entirely).
+            if "detach" not in local_op and "on_timeout" not in local_op:
+                local_op["on_timeout"] = "detach"
+                local_op["_auto_detach"] = True
+            return await op_bash(local_op, timeout)
+        elif op_type == "read":
+            return await op_read(op)
+        elif op_type == "write":
+            return await op_write(op)
+        elif op_type == "patch":
+            return await op_patch(op)
+        elif op_type in ("sql", "db_exec", "omni_sql"):
+            args = dict(op)
+            db_name = args.pop("database", "") or "dispatch"
+            sql_ops = args.pop("queries", None) or args.pop("operations", None) or []
+            if not sql_ops:
+                single_sql = args.pop("sql", None) or args.pop("query", None) or args.pop("command", None)
+                if single_sql:
+                    params = args.pop("params", ())
+                    sql_ops = [{"sql": single_sql, "params": params}]
+            
+            explicit_mode = args.pop("mode", None)
+            if explicit_mode:
+                mode = explicit_mode
+            else:
+                # A1 (S2b 2026-09-25): default is read_only, as the schema says. Writes need an
+                # explicit "mode":"read_write" (was: any non-SELECT silently auto-promoted).
+                mode = "read_only"
+                if os.environ.get("FLEET_EXEC_SQL_AUTOPROMOTE") == "1":
+                    for q in sql_ops:
+                        q_str = q.get("sql", "") if isinstance(q, dict) else str(q)
+                        q_upper = q_str.strip().upper()
+                        if not (q_upper.startswith("SELECT") or q_upper.startswith("PRAGMA") or q_upper.startswith("EXPLAIN")):
+                            mode = "read_write"
+                            break
+
+            sql_payload = {
+                "database": db_name,
+                "mode": mode,
+                "clamp_limit": args.pop("clamp_limit", True),
+            }
+            sql_payload["count_only"] = bool(args.pop("_count_only", False) or args.pop("count_only", False))
+            for q in sql_ops:
+                if isinstance(q, dict) and "_count_only" not in q:
+                    q["_count_only"] = sql_payload["count_only"]
+            sql_payload["queries"] = sql_ops
+            res = await op_sql(sql_payload)
+            if not res.get("ok") and mode == "read_only" and "read_only" in str(res.get("error", "")):
+                res["error"] = str(res.get("error")) + ' — add "mode":"read_write" to this sql op to write'
+            return res
+        elif op_type == "fix_json":
+            return await op_fix_json(op)
+        elif op_type == "glob":
+            return await op_glob(op)
+        elif op_type == "grep":
+            return await op_grep(op)
+        else:
+            return {"ok": False, "error": f"Unsupported operation type: {op_type}"}
+
+    result = await _execute()
+    _omnibreak_record(op_type, op_hash, result.get("ok", False), result.get("error", ""))
+    result.setdefault("_key_hash", op_hash)
+    
+    if result.get("ok"):
+        return result
+    
+    # F1: Omnitool Dispatch Doctor - Fix and re-run ONCE
+    # Only attempt doctoring on the initial failure of a bash op
+    if op_type == "bash" and not op.get("_doctor_attempted"):
+        fixed_op, fix_category = _doctor_diagnose_and_fix(op, result)
+        
+        if fix_category:
+            # Re-run the command with the fix category
+            local_op = dict(fixed_op)
+            if "detach" not in local_op and "on_timeout" not in local_op:
+                local_op["on_timeout"] = "detach"
+                local_op["_auto_detach"] = True
+            
+            doctor_result = await op_bash(local_op, timeout)
+            
+            # Augment result with doctor attempt details
+            doctor_result["_doctor_attempted"] = True
+            doctor_result["_doctor_category"] = fix_category
+            doctor_result["_doctor_original_command"] = op.get("command")
+            
+            # Record result before returning
+            if doctor_result.get("ok"):
+                doctor_result["_doctor_fixed"] = True
+                _omnibreak_record(op_type, op_hash, True, "")
+                return doctor_result
+            else:
+                # Doctor failed. Augment the original failure result for final return.
+                result["_doctor_attempted"] = True
+                result["_doctor_category"] = fix_category
+                result["_doctor_attempted_command"] = fixed_op.get("command")
+                # Fall through to diagnostics and regular retries
+
+    result["_diagnostics"] = _extract_diagnostics(op_type, result)
+    result.setdefault("_op_type", op_type)
+    
+    for attempt in range(max_retries):
+        retryable, category = _is_retryable(op_type, result.get("error", ""))
+        if not retryable:
+            return result
+        delay = _compute_delay(attempt, category)
+        await asyncio.sleep(delay)
+        
+        breaker = _omnibreak_check(op_type, op_hash)
+        if breaker.get("abort"):
+            result["breaker_aborted"] = breaker["reason"]
+            return result
+            
+        result = await _execute()
+        if result.get("ok"):
+            result.setdefault("_retried", True)
+            result.setdefault("_key_hash", op_hash)
+            result["_retry_attempts"] = attempt + 1
+            result["_retry_category"] = category
+            _omnibreak_record(op_type, op_hash, True, "")
+            return result
+        _omnibreak_record(op_type, op_hash, False, result.get("error", ""))
+
+    result.setdefault("_key_hash", op_hash)
+    result["_retried"] = True
+    result["_retry_attempts_failed"] = max_retries + 1
+    result["_retry_category"] = category
+    return result
+
+
+def _inject_capsule(r: Dict[str, Any]):
+    """Attach a _capsule dict with emoji/icon/label/status for MCP client rendering."""
+    r.setdefault("_capsule", {
+        "icon": "🔹",
+        "label": f"{r.get('type', '?')} step={r.get('step', '?')}",
+        "kind": r.get("type", ""),
+        "status": "ok" if r.get("ok") else "error",
+    })
+
+
+def _compact_result(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip non-actionable metadata from successful ops.
+    Only errors keep full output. Success gets: ok + minimal payload."""
+    if not r.get("ok", False):
+        return r  # Errors need full context for debugging
+
+    # Metadata keys to drop from successful ops (keep duration_ms for timing)
+    skip = {"step", "type", "sha256", "bytes", "truncated",
+            "total_operations", "concurrency", "bytes_written", "size_bytes",
+            "dry_run", "clamped",
+            "failed_step", "rolled_back"}   # 2026-09-26: rows_affected/last_row_id/row_count kept (a write must be verifiable)
+
+    # Top-level wrapper: strip boilerplate
+    result_keys = {}
+    for k in ("ok", "n", "results"):
+        if k in r:
+            result_keys[k] = r[k]
+
+    # Strip internal keys from individual results
+    stripped = {k: v for k, v in r.items() if k not in skip}
+    result_keys.update(stripped)
+
+    # Compact SQL results: trim large row sets, replace with count+first few
+    if "results" in result_keys and isinstance(result_keys["results"], list):
+        compacted_results = []
+        for sub in result_keys["results"]:
+            if isinstance(sub, dict):
+                # Drop noise keys from each sub-result
+                clean = {k: v for k, v in sub.items() if k not in skip}
+
+                # Rows are already bounded by fleet_sql's LIMIT (default 5, explicit <=200).
+                # 2026-09-26 dogfood: this used to cut to rows_first[:3] on top of that, so an
+                # explicit LIMIT 10 printed 3 rows while reporting count 5. Pass rows through.
+                if "rows" in clean and isinstance(clean["rows"], list):
+                    rows = clean.pop("rows")
+                    clean["n"] = len(rows)
+                    clean["rows"] = rows
+                elif "n_rows" in clean:
+                    # Old-style count-only field stays as-is
+                    pass
+
+                compacted_results.append(clean)
+            else:
+                compacted_results.append(sub)
+        result_keys["results"] = compacted_results
+
+    # Add circuit-breaker key hint (first 12 chars of SHA) for omnibreak tracking
+    key_hint = r.get("_key_hash", "")[:12] if r.get("_key_hash") else ""
+    if key_hint:
+        result_keys["_hash_prefix"] = key_hint
+    
+    return result_keys
+
+
+async def run_pipeline(payload: Dict[str, Any]) -> Dict[str, Any]:
+    start_total = time.time()
+
+    # Phase 1: structural validation before any execution
+    validation_errors = validate_payload(payload)
+    if validation_errors:
+        return {
+            "ok": False, "errs": validation_errors,
+        }
+
+    # Phase 1.2: deterministic safety gate — a blocked op refuses the WHOLE batch before
+    # anything runs (no half-executed batches). Warnings ride along in result["_guard"].
+    _blocked, _guard_report = omnitool_guard.check_payload(payload.get("operations") or payload.get("tasks") or [])
+    payload["_guard"] = _guard_report
+    if _blocked:
+        return {"ok": False, "errs": _blocked, "_guard": _guard_report}
+
+    # Phase 1.5: semantic validation (conflicts, inefficiencies)
+    semantic_warnings = _semantic_analyze(payload)
+
+    operations = payload.get("operations") or payload.get("tasks") or []
+    mode = payload.get("concurrency", "parallel")
+    timeout_s = float(payload.get("timeout_s", DEFAULT_TIMEOUT_S))
+    stop_on_error = payload.get("stop_on_error", False)
+
+    results = []
+
+    def _op_should_abort(op: Dict, result: Dict) -> bool:
+        """Check if this op's failure should halt the batch.
+        
+        Per-op 'on_failure' policy takes precedence over global stop_on_error.
+        'abort' = halt batch; 'continue' = proceed; unset = follow stop_on_error (default False).
+        """
+        if result.get("ok", True):
+            return False
+        policy = op.get("on_failure")
+        if policy == "continue":
+            return False
+        if policy == "abort":
+            return True   # 2026-09-26: explicit abort now halts (was: fell through to stop_on_error=False)
+        return stop_on_error
+
+    if mode == "auto":
+        # Item 4, FLEET-KB-OMNITOOL-PROTOCOL-PLAN.md Phase 2: instead of a
+        # binary parallel/sequential choice, compute real read/write
+        # dependency layers (DependencyGraph, previously built but never
+        # wired into fleet-exec itself) and run each layer in parallel, with
+        # layers themselves sequential. Ops with no dependency at all still
+        # get full parallelism; a write followed by a read (or a second write)
+        # of the same path is correctly serialized instead of racing.
+        graph = DependencyGraph(operations)
+        graph.build()
+        layers = graph.topological_sort()
+        results_by_idx: Dict[int, Dict[str, Any]] = {}
+        for layer in layers:
+            layer_tasks = [dispatch_single(operations[idx], timeout_s) for idx in layer]
+            outcomes = await asyncio.gather(*layer_tasks, return_exceptions=True)
+            for idx, outcome in zip(layer, outcomes):
+                if isinstance(outcome, Exception):
+                    r = {"step": idx, "ok": False, "error": str(outcome)}
+                else:
+                    r = outcome
+                    r.setdefault("step", idx)
+                    r["type"] = (operations[idx].get("type") or operations[idx].get("tool"))
+                _inject_capsule(r)
+                results_by_idx[idx] = _compact_result(r)
+            if any(_op_should_abort(operations[idx], results_by_idx[idx]) 
+                   for idx in layer if idx in results_by_idx):
+                break
+        results = [results_by_idx[i] for i in sorted(results_by_idx.keys())]
+    elif mode == "parallel":
+        tasks = [dispatch_single(op, timeout_s) for op in operations]
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for idx, outcome in enumerate(outcomes):
+            if isinstance(outcome, Exception):
+                r = {"step": idx, "ok": False, "error": str(outcome)}
+            else:
+                r = outcome
+                r.setdefault("step", idx)
+                r["type"] = (operations[idx].get("type") or operations[idx].get("tool"))
+            # Post-process: compact successful ops, keep failures intact
+            _inject_capsule(r)
+            results.append(_compact_result(r))
+            if _op_should_abort(operations[idx], r):
+                break
+    else:
+        for idx, op in enumerate(operations):
+            try:
+                res = await dispatch_single(op, timeout_s)
+            except Exception as e:
+                res = {"ok": False, "error": str(e)}
+            res["step"] = idx
+            res["type"] = op.get("type") or op.get("tool")
+            _inject_capsule(res)
+            results.append(_compact_result(res))
+            if _op_should_abort(op, res):
+                break
+
+    total_duration_ms = round((time.time() - start_total) * 1000, 2)
+    all_ok = all(r.get("ok", False) for r in results)
+
+    return {
+        "ok": all_ok,
+        "n": len(results),
+        "duration_ms": total_duration_ms,
+        "results": results,
+        "_semantic_warnings": semantic_warnings,  # structural conflicts / inefficiencies
+    }
+
+
+def _emit_sse_event(fileobj, event_type: str, data: Any):
+    """Emit a Server-Sent Event (SSE) line."""
+    fileobj.write(f"event: {event_type}\n")
+    if isinstance(data, (dict, list)):
+        data_str = json.dumps(data, separators=(',', ':'))
+    else:
+        data_str = str(data)
+    for line in data_str.split('\n'):
+        fileobj.write(f"data: {line}\n")
+    fileobj.write("\n")
+    fileobj.flush()
+
+
+async def run_pipeline_stream(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Streaming mode: emit per-operation events as they complete via SSE."""
+    start_total = time.time()
+
+    validation_errors = validate_payload(payload)
+    if validation_errors:
+        return {"ok": False, "errs": validation_errors}
+    _blocked, _guard_report = omnitool_guard.check_payload(payload.get("operations") or payload.get("tasks") or [])
+    payload["_guard"] = _guard_report
+    if _blocked:
+        return {"ok": False, "errs": _blocked, "_guard": _guard_report}
+
+    operations = payload.get("operations") or payload.get("tasks") or []
+    timeout_s = float(payload.get("timeout_s", DEFAULT_TIMEOUT_S))
+    stop_on_error = payload.get("stop_on_error", False)
+
+    # Emit header event
+    _emit_sse_event(sys.stdout, "header", {"total_ops": len(operations)})
+
+    results = []
+
+    if payload.get("concurrency", "parallel") == "parallel":
+        async def _dispatch_emit(op, idx):
+            try:
+                res = await dispatch_single(op, timeout_s)
+            except Exception as e:
+                res = {"ok": False, "error": str(e)}
+            res["step"] = idx
+            res["type"] = op.get("type") or op.get("tool")
+            compacted = _compact_result(res)
+            compacted["_idx"] = idx
+            return compacted, op  # return both result AND original op for policy check
+
+        tasks = [asyncio.create_task(_dispatch_emit(op, idx)) for idx, op in enumerate(operations)]
+        pending = set(tasks)
+        done_ids = set()  # track task ids already collected
+        aborted = False
+        while pending and not aborted:
+            done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done_set:
+                if id(task) not in done_ids:
+                    done_ids.add(id(task))
+                    r, orig_op = task.result()
+                    _emit_sse_event(sys.stdout, "op_result", r)
+                    results.append(r)
+                    if _op_should_abort(orig_op, r):
+                        aborted = True
+                        break
+            if aborted:
+                for t in pending:
+                    t.cancel()
+                break
+        # Collect any still-pending (cancelled or exception)
+        for t in tasks:
+            if id(t) not in done_ids:
+                try:
+                    r, _ = t.result()
+                    results.append(r)
+                except asyncio.CancelledError:
+                    pass
+    else:
+        for idx, op in enumerate(operations):
+            try:
+                res = await dispatch_single(op, timeout_s)
+            except Exception as e:
+                res = {"ok": False, "error": str(e)}
+            res["step"] = idx
+            res["type"] = op.get("type") or op.get("tool")
+            compacted = _compact_result(res)
+            compacted["_idx"] = idx
+            results.append(compacted)
+            _emit_sse_event(sys.stdout, "op_result", compacted)
+            if _op_should_abort(op, res):
+                break
+
+    total_duration_ms = round((time.time() - start_total) * 1000, 2)
+    all_ok = all(r.get("ok", False) for r in results)
+    final = {"ok": all_ok, "n": len(results), "duration_ms": total_duration_ms}
+    _emit_sse_event(sys.stdout, "final", final)
+    return final
+
+
+def _record_field_marks(payload: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Stigmergy (STIGMERGY-LOOP 2026-09-27): every act leaves a mark in the Weaver field
+    (~/.weaver/control-center/field.sqlite) — file for write/patch, command for bash, db for sql
+    writes, read (light), violation for a guard block. Identity comes from the caller's env
+    (TALON_SESSION / TALON_TASK_ID / TALON_ROLE / FLEET_SEAT). Evidence only; fail-open; FLEET_EXEC_MARKS=0 off."""
+    if os.environ.get("FLEET_EXEC_MARKS", "1") == "0" or not isinstance(result, dict):
+        return
+    try:
+        sys.path.insert(0, str(AI_STACK / "weaver"))
+        import marks as _field
+    except Exception:
+        return
+    ops = payload.get("operations") or payload.get("tasks") or []
+    res = result.get("results") or []
+    rows: List[Dict[str, Any]] = []
+    if result.get("errs") and payload.get("_guard"):
+        for op, g in zip(ops, payload["_guard"]):
+            if isinstance(op, dict) and isinstance(g, dict) and g.get("level") == "block":
+                tgt = op.get("command") or op.get("path") or op.get("sql") or op.get("query") or ""
+                rows.append({"kind": "violation", "target": str(tgt)[:300], "weight": 2.0,
+                             "outcome": ",".join(r["id"] for r in g.get("rules", []) if r.get("level") == "block")})
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict) or i >= len(res):
+            continue
+        t = op.get("type") or op.get("tool")
+        r = res[i] if isinstance(res[i], dict) else {}
+        outcome = "ok" if r.get("ok") else "fail"
+        if t in ("write", "patch", "fix_json"):
+            p = op.get("path") or op.get("target") or r.get("path") or ""
+            rows.append({"kind": "file", "target": str(Path(os.path.expanduser(p)).resolve()) if p else "(patch)", "outcome": outcome})
+        elif t == "bash":
+            rows.append({"kind": "command", "target": str(op.get("command", ""))[:300], "outcome": outcome, "weight": 0.5})
+        elif t in ("sql", "db_exec", "omni_sql") and op.get("mode") == "read_write":
+            rows.append({"kind": "db", "target": str(op.get("database") or "dispatch"), "outcome": outcome})
+        elif t == "read" and op.get("path"):
+            rows.append({"kind": "read", "target": str(Path(os.path.expanduser(op["path"])).resolve()), "outcome": outcome, "weight": 0.3})
+    _field.record_many(rows, source="fleet-exec")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fleet Omni-Tool Execution Engine")
+    parser.add_argument("payload", nargs="?", default="", help="JSON payload string, file path, or '-' for stdin")
+    parser.add_argument("--file", "-f", help="Path to JSON payload file")
+    parser.add_argument("--concurrency", choices=["parallel", "sequential", "auto"], help="Override concurrency mode")
+    parser.add_argument("--output", choices=["json", "pretty"], default="json", help="Output format")
+    parser.add_argument("--validate-only", action="store_true",
+                         help="Check the payload structurally and exit — no operations run")
+    parser.add_argument("--mode", choices=["normal", "stream"], default="normal",
+                         help="Execution mode: normal (JSON) or stream (SSE)")
+    parser.add_argument("--validate-semantic", action="store_true",
+                         help="Run semantic analysis before execution (warns on conflicts)")
+    parser.add_argument("--audit-trail", type=str, default=None,
+                         help="Append execution audit entry as JSON line to this file")
+
+    args = parser.parse_args()
+
+    # Initialize omnibreak circuit breaker DB (best-effort)
+    _omnibreak_init()
+
+    raw_payload = ""
+    if args.file and Path(args.file).exists():
+        raw_payload = Path(args.file).read_text(encoding="utf-8")
+    elif args.payload == "-" or (not args.payload and not sys.stdin.isatty()):
+        raw_payload = sys.stdin.read()
+    elif args.payload:
+        stripped = args.payload.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            raw_payload = args.payload
+        elif len(args.payload) < 255 and os.path.isfile(args.payload):
+            raw_payload = Path(args.payload).read_text(encoding="utf-8")
+        else:
+            raw_payload = args.payload
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        payload = json.loads(raw_payload)
+        if isinstance(payload, list):
+            payload = {"operations": payload}
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": f"JSON payload parse error: {e}"}))
+        sys.exit(1)
+
+    # Pre-flight engine: canonical normalization (handles malformed JSON,
+    # naked objects, alias extraction, quote fixing, type inference, etc.)
+    try:
+        from omnitool_preflight import OmnitoolPreFlightEngine
+        payload = OmnitoolPreFlightEngine.sanitize_and_wrap(payload)
+    except Exception as e:
+        # Non-fatal: fall through to validator with original payload
+        sys.stderr.write(f"[preflight] normalization failed: {e}\n")
+
+    # Intent classifier (BERT): semantic intent, safety, anomaly detection, semantic cache
+    # Priority: C++ Unix socket -> Python HTTP daemon -> local classifier
+    def _call_intent_daemon(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Call the BERT classifier; priority: C++ Unix socket -> Python HTTP -> local.
+        Release 0.1.0: FLEET_EXEC_CLASSIFIER=off skips all tiers (the advisory label is then
+        unrated; the deterministic guard still decides safety). OMNITOOL_INTENT_URL overrides
+        the daemon address (default http://127.0.0.1:8498)."""
+        if os.environ.get("FLEET_EXEC_CLASSIFIER", "on").lower() in ("off", "0", "false"):
+            return {"intent": None, "safety": None, "safety_confidence": 0, "classifier": "off"}
+        # 1. C++ Unix socket — OFF the production path (2026-09-26): omnitool-bert-server is an
+        # experiment (SYSTEMS.yaml: inference never built, unit disabled) and embedding safety was
+        # measured not to discriminate; safety now comes from omnitool_guard. Opt in with
+        # FLEET_EXEC_BERT_SOCKET=1 when the reflex-tier classifier lands on this socket.
+        import socket
+        import time
+        for attempt in (range(3) if __import__("os").environ.get("FLEET_EXEC_BERT_SOCKET") == "1" else ()):
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                sock.connect("/tmp/omnitool_bert.sock")
+                sock.sendall(json.dumps({"payload": payload}).encode())
+                sock.shutdown(socket.SHUT_WR)
+                chunks = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk: break
+                    chunks.append(chunk)
+                sock.close()
+                result = json.loads(b''.join(chunks).decode())
+                if "error" in result:
+                    raise RuntimeError(result["error"])  # e.g. fast-path classifier not implemented
+                return result
+            except (ConnectionRefusedError, BrokenPipeError, ConnectionResetError):
+                if attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                pass  # Fall through on last attempt
+            except Exception:
+                pass  # Fall through for other exceptions
+
+        # 2. Try Python HTTP daemon (warm, ~2ms)
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                os.environ.get("OMNITOOL_INTENT_URL", "http://127.0.0.1:8498").rstrip("/") + "/classify",
+                data=json.dumps({"payload": payload}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return json.loads(resp.read().decode())
+        except Exception:
+            pass  # Fall through
+
+        # 3. Fallback: local classifier (cold, ~2.5s first time)
+        try:
+            # (release 0.1.0: the local `import os` here was removed -- it made `os` function-local,
+            # which would break the module-level os use added above; os is imported at module top.)
+            os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+            import warnings
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+            from omnitool_intent_classifier import classify_payload
+            return classify_payload(payload)
+        except Exception as e:
+            sys.stderr.write(f"[intent] all classifiers failed: {e}\n")
+            return None
+
+    intent_result = _call_intent_daemon(payload)
+    if intent_result:
+        payload["_intent"] = intent_result
+        if intent_result.get("cached_result") and os.environ.get("FLEET_EXEC_SEMANTIC_CACHE") == "1":
+            # Semantic cache HIT — return cached result WITHOUT executing. Opt-in only (S2b
+            # 2026-09-25): a 0.98-similar earlier result is not proof this bash/write/sql op is a no-op.
+            print(json.dumps(intent_result["cached_result"]))
+            sys.exit(0)
+        # ANOMALY DETECTION REMOVED 2026-09-22/23 (DL-omnitool-12): nearest-
+        # prototype cosine distance on all-MiniLM-L6-v2 did not discriminate
+        # — measured a fork bomb (":(){ :|:& };:") scoring LOWER anomaly
+        # (0.798) than plain `mkdir newdir` (0.809) or `chmod +x` (0.852),
+        # with 5/20 ordinary commands false-positiving. This was not a
+        # threshold-tuning problem — normal and anomalous inputs occupied
+        # overlapping score ranges with this embedding model + prototype
+        # set, so no threshold separated them. The classifier no longer
+        # computes anomaly_score/is_anomaly per-text; the `safety` label
+        # (safe/destructive/network) is the supported signal — it showed
+        # genuine, verified discrimination (see test_classifier.py).
+        # TOOL-9: warn only above a confidence floor (a plain SELECT scored network@0.115).
+        _safety_min = float(os.environ.get("FLEET_EXEC_SAFETY_MIN", "0.6"))
+        if (intent_result.get("safety") in ("destructive", "network")
+                and float(intent_result.get("safety_confidence") or 0) >= _safety_min):
+            sys.stderr.write(f"[INTENT-SAFETY] safety={intent_result['safety']} confidence={intent_result['safety_confidence']:.3f}\n")
+
+    if args.concurrency:
+        payload["concurrency"] = args.concurrency
+
+    # Semantic pre-check (warns on conflicts but doesn't block)
+    try:
+        semantics = _semantic_analyze(payload)
+        if isinstance(semantics, dict):
+            warnings_list = semantics.get("warnings", [])
+        elif isinstance(semantics, list):
+            warnings_list = semantics
+        else:
+            warnings_list = []
+        for w in warnings_list:
+            if isinstance(w, dict) and w.get("level") in ("CONFLICT", "RACE"):
+                sys.stderr.write(f"[SEM-WARN] {w.get('detail', str(w))}\n")
+                sys.stderr.flush()
+    except Exception:
+        pass  # Non-fatal
+
+    if args.validate_only:
+        errors = validate_payload(payload)
+        result = {"ok": not errors, "errs": errors}
+        if args.validate_semantic:
+            result["_sem_warnings"] = _semantic_analyze(payload)
+        print(json.dumps(result, indent=2 if args.output == "pretty" else None))
+        sys.exit(0 if not errors else 1)
+
+    if payload.get("detach"):
+        # Whole-batch background: re-invoke this same CLI, recursively, as a
+        # detached child running the full operations list (sequential or
+        # parallel per 'concurrency') and return immediately with a handle.
+        # This is how a chain of ops that must run one-after-another gets to
+        # fire in the background without the caller waiting on any of it.
+        inner_payload = {k: v for k, v in payload.items() if k != "detach"}
+        log_path = payload.get("log_path") or f"/tmp/fleet-exec-batch-{int(time.time()*1000)}.log"
+        try:
+            logf = open(log_path, "ab")
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), json.dumps(inner_payload)],
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True, cwd=str(AI_STACK),
+            )
+            logf.close()
+            print(json.dumps({
+                "ok": True, "detached": True, "pid": proc.pid, "log_path": log_path,
+                "n_ops": len(operations if (operations := (payload.get("operations") or payload.get("tasks") or [])) else []),
+            }))
+            sys.exit(0)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            sys.exit(1)
+
+    # Execute in requested mode
+    if args.mode == "stream":
+        sys.stdout.reconfigure(line_buffering=True)
+        result = asyncio.run(run_pipeline_stream(payload))
+    else:
+        result = asyncio.run(run_pipeline(payload))
+
+    # Surface the intent/safety/anomaly classification to the caller instead of
+    # only leaking it via stderr warnings — an agent acting on this result should
+    # be able to see why it was flagged, not just that a warning was printed.
+    _gw = [{"op": i, "rules": [x["id"] for x in r["rules"]]} for i, r in enumerate(payload.get("_guard") or [])
+           if isinstance(r, dict) and r.get("level") == "warn"]
+    if _gw and isinstance(result, dict) and "_guard" not in result:
+        result["_guard"] = _gw
+        for w in _gw:
+            sys.stderr.write(f"[GUARD-WARN] op[{w['op']}] {', '.join(w['rules'])}\n")
+    if payload.get("_intent"):
+        intent_data = payload["_intent"]
+        if isinstance(intent_data, dict):
+            # TOOL-9 floor applies here too (was: raw label at any confidence -> SELECT shown as "destructive").
+            _smin = float(os.environ.get("FLEET_EXEC_SAFETY_MIN", "0.6"))
+            _sconf = float(intent_data.get("safety_confidence") or 0)
+            # safety: the deterministic guard wins when a rule fired (source "guard"); otherwise the
+            # embedding classifier's label above its floor (advisory, source "classifier"), else unrated.
+            _g = [r for r in (payload.get("_guard") or []) if isinstance(r, dict) and r.get("rules")]
+            _gsaf = next((r["safety"] for r in _g if r["level"] == "block"), None) or next((r["safety"] for r in _g), None)
+            result["_intent"] = {
+                "intent": intent_data.get("intent"),
+                "safety": _gsaf or (intent_data.get("safety") if _sconf >= _smin else "unrated"),
+                "safety_source": "guard" if _gsaf else ("classifier" if _sconf >= _smin else "none"),
+                "is_anomaly": intent_data.get("is_anomaly", False)
+            }
+        else:
+            result["_intent"] = intent_data
+
+    _record_field_marks(payload, result)
+
+    # Audit trail append
+    if args.audit_trail:
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ok": result.get("ok"),
+            "n_ops": result.get("n", len(result.get("results", []))),
+            "duration_ms": result.get("duration_ms", 0),
+            "errors_count": sum(1 for r in result.get("results", []) if not r.get("ok"))
+        }
+        try:
+            with open(args.audit_trail, "a", encoding="utf-8") as af:
+                af.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+
+    if args.output == "pretty":
+        print(json.dumps(result, indent=2))
+    else:
+        print(json.dumps(result))
+
+    if not result.get("ok"):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

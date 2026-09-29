@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Omnitool Operations Payload",
+  "type": "object",
+  "properties": {
+    "operations": {
+      "type": "array",
+      "description": "Array of operation objects, or single operation object",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["bash", "read", "write", "patch", "sql", "search_files", "glob_files", "inspect_agent", "fix_json"]
+          },
+          "command": { "type": "string" },
+          "path": { "type": "string" },
+          "content": { "type": "string" },
+          "diff": { "type": "string" },
+          "database": { "type": "string" },
+          "queries": { "type": "string" },
+          "pattern": { "type": "string" },
+          "file_pattern": { "type": "string" },
+          "target_agent": { "type": "string" },
+          "fields": { "type": "array", "items": { "type": "string" } },
+          "max_results": { "type": "integer", "default": 50 },
+          "timeout_s": { "type": "integer", "default": 30 },
+          "timeout_ms": { "type": "integer" },
+          "detach": { "type": "boolean", "default": false },
+          "log_path": { "type": "string" }
+        },
+        "required": ["type"],
+        "allOf": [
+          { "if": { "properties": { "type": { "const": "bash" } } }, "then": { "required": ["command"] } },
+          { "if": { "properties": { "type": { "const": "read" } } }, "then": { "required": ["path"] } },
+          { "if": { "properties": { "type": { "const": "write" } } }, "then": { "required": ["path", "content"] } },
+          { "if": { "properties": { "type": { "const": "patch" } } }, "then": { "required": ["path", "diff"] } },
+          { "if": { "properties": { "type": { "const": "sql" } } }, "then": { "required": ["database", "queries"] } },
+          { "if": { "properties": { "type": { "const": "search_files" } } }, "then": { "required": ["pattern"] } },
+          { "if": { "properties": { "type": { "const": "glob_files" } } }, "then": { "required": ["pattern"] } },
+          { "if": { "properties": { "type": { "const": "inspect_agent" } } }, "then": { "required": ["target_agent"] } },
+          { "if": { "properties": { "type": { "const": "fix_json" } } }, "then": { "required": ["path"] } }
+        ]
+      }
+    },
+    "concurrency": { "type": "string", "enum": ["parallel", "sequential", "auto"], "default": "parallel" },
+    "stop_on_error": { "type": "boolean", "default": false },
+    "timeout_s": { "type": "integer", "default": 30 },
+    "detach": { "type": "boolean", "default": false },
+    "log_path": { "type": "string" }
+  },
+  "required": ["operations"],
+  "additionalProperties": true
+}
