@@ -100,3 +100,7 @@ origin is undocumented; see `PROVENANCE.md`).
   fix planned upstream.
 * The `schemas/omnitool_operations.json` enum is a historical superset; `bin/fleet-exec`'s `ALLOWED_OP_TYPES`
   is authoritative.
+
+## Dossier
+
+History, specification, metrics, tests and limits: [`DOSSIER.md`](DOSSIER.md). Guide to the whole stack: [Hyperdimensional Computing and You](https://github.com/SovRing-Labs/omniring-research/blob/main/docs/guide/HYPERDIMENSIONAL-COMPUTING-AND-YOU.md).
