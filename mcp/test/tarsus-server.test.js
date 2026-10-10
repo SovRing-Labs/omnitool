@@ -36,6 +36,18 @@ test("edit round-trip through the handler (write gate is a no-op in the release)
   await rm(dir, { recursive: true, force: true });
 });
 
+test("edit refuses a missing new_string and leaves the file untouched (DL-omnitool-28: it used to write the text 'undefined')", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "tarsus-rel-"));
+  const path = join(dir, "f.txt");
+  await writeFile(path, "alpha beta", "utf8");
+  for (const args of [{ path, old_string: "beta" }, { path, old_string: "beta", new_string: null }, { path, old_string: "beta", new_string: 5 }]) {
+    const r = await handleToolCall({ params: { name: "edit", arguments: args } });
+    assert.ok(r.isError || /^ERROR/.test(r.content[0].text), JSON.stringify(r));
+  }
+  assert.equal(await readFile(join(dir, "f.txt"), "utf8"), "alpha beta");
+  await rm(dir, { recursive: true, force: true });
+});
+
 test("a guard-blocked op names its approval fingerprint", async () => {
   const r = await handleToolCall({ params: { name: "bash", arguments: { command: "git push --force origin x", cwd: tmpdir() } } });
   assert.match(r.content[0].text, /approval fingerprint: [0-9a-f]{16}/);
