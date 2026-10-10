@@ -1,18 +1,18 @@
 {
-  "name": "omnitool-mcp-server",
-  "version": "0.1.0",
-  "description": "MCP server exposing the omnitool batch executor (bin/fleet-exec) as fleet_exec / fleet_exec_validate",
+  "name": "tarsus-mcp-server",
+  "version": "0.2.0",
+  "description": "MCP server for Tarsus: the release tool set (fleet_exec, fleet_exec_validate, read, read_many, write, edit, grep, glob, bash, sql) over bin/fleet-exec",
   "license": "SEE LICENSE IN ../LICENSING.md",
   "private": true,
   "type": "module",
   "bin": {
-    "omnitool-mcp-server": "src/index.js"
+    "tarsus-mcp-server": "src/tarsus-server.js"
   },
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node src/tarsus-server.js",
     "test": "MCP_TEST_MODE=1 node --test test/*.test.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4"
+    "@modelcontextprotocol/sdk": "^1.30.0"
   }
 }

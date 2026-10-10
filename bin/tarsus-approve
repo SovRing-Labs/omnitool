@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""tarsus-approve — a HUMAN approves one blocked op (TARSUS-0 A4, J 2026-10-06).
+
+    tarsus-approve            list ops waiting for approval (fingerprint, rule, command)
+    tarsus-approve <fp>       show that op and ask y/N on the terminal; yes = one-shot token (15 min)
+
+Needs an interactive terminal (reads the answer from /dev/tty): an agent's pipe cannot approve. The guard also blocks
+any agent command naming this tool, and the token dir (~/.config/tarsus/approvals) is outside every write scope and
+sandbox grant. The other human channel is the MCP approval prompt (elicitation) in a client that supports it.
+"""
+import datetime
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import omnitool_guard as g  # noqa: E402
+
+
+def pending() -> list:
+    d = Path(g.APPROVAL_DIR) / "pending"
+    out = []
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            out.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def main(argv) -> int:
+    rows = pending()
+    if not argv:
+        if not rows:
+            print("no ops waiting for approval")
+        for r in rows:
+            age = datetime.datetime.fromtimestamp(r.get("ts", 0)).strftime("%H:%M:%S")
+            print(f"{r['fp']}  {age}  [{r.get('why', '')[:60]}]\n    {r.get('op', '')[:200]}")
+        return 0
+    fp = argv[0].strip()
+    row = next((r for r in rows if r["fp"] == fp), None)
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        print("tarsus-approve: needs an interactive terminal (an agent cannot approve)", file=sys.stderr)
+        return 2
+    if not (sys.stdin.isatty() and os.isatty(tty.fileno())):
+        print("tarsus-approve: needs an interactive terminal (an agent cannot approve)", file=sys.stderr)
+        return 2
+    if row is None:
+        tty.write(f"no pending op with fingerprint {fp} — approve anyway (you must know exactly what it runs)? [y/N] ")
+    else:
+        tty.write(f"op   : {row.get('op', '')}\nrule : {row.get('why', '')}\napprove this ONE run (15 min)? [y/N] ")
+    tty.flush()
+    if tty.readline().strip().lower() not in ("y", "yes"):
+        print("not approved")
+        return 1
+    path = g.mint_approval(fp, by=f"tty:{os.environ.get('USER', '?')}", op_summary=(row or {}).get("op", ""))
+    print(f"approved {fp} (one use, expires in {g.APPROVAL_TTL_S // 60} min) -> {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

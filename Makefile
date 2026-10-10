@@ -1,4 +1,4 @@
-# omnitool release Makefile. Python 3.10+ (pytest), Node 22+ (node:test, node:sqlite).
+# Tarsus (was omnitool) release Makefile. Python 3.10+ (pytest), Node 22+ (node:test).
 # `make test` passes on a clean checkout: nothing excluded from the release is needed.
 PY ?= python3
 ORT_DIR ?= third_party/onnxruntime
@@ -9,7 +9,7 @@ BUILD = build
 
 test: test-guard test-py test-mcp
 
-# 59-case deterministic safety-guard selftest
+# deterministic safety-guard selftest (62 cases incl. human-approval A4)
 test-guard:
 	$(PY) bin/omnitool_guard.py selftest
 
@@ -21,8 +21,8 @@ test-py:
 test-mcp:
 	@cd mcp && MCP_TEST_MODE=1 node --test --test-reporter=spec test/truncate.test.js
 	@if [ -d mcp/node_modules/@modelcontextprotocol/sdk ]; then \
-	  cd mcp && MCP_TEST_MODE=1 node --test --test-reporter=spec test/tools.test.js; \
-	else echo "SKIP mcp/test/tools.test.js: @modelcontextprotocol/sdk not installed (cd mcp && npm install)"; fi
+	  cd mcp && MCP_TEST_MODE=1 node --test --test-reporter=spec test/tarsus-server.test.js; \
+	else echo "SKIP mcp/test/tarsus-server.test.js: @modelcontextprotocol/sdk not installed (cd mcp && npm install)"; fi
 
 # Optional, experimental C++ interceptor. Needs ONNX Runtime 1.18.x and nlohmann/json 3.11.x (README "Build").
 interceptor: $(BUILD)/omnitool_bert_server

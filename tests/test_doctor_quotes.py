@@ -3,7 +3,9 @@ import os
 import subprocess
 from importlib.machinery import SourceFileLoader
 
-FE = os.environ.get("FLEET_EXEC_PATH") or os.path.join(os.path.dirname(__file__), "..", "bin", "fleet-exec")
+from pathlib import Path as _P
+# tool root = first parent holding bin/fleet-exec (dev tree or release export)
+FE = os.environ.get("FLEET_EXEC_PATH") or str(next(p for p in _P(__file__).resolve().parents if (p / "bin" / "fleet-exec").exists()) / "bin" / "fleet-exec")
 ERR = {"ok": False, "exit_code": 2, "stderr": "/bin/sh: -c: line 1: unexpected EOF while looking for matching `''"}
 
 

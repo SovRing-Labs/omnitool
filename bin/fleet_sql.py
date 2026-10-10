@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ┌─ CORE FILE · governed by control-center/core-changelog.jsonl ──────────
+# │ ⚠  LOAD-BEARING. 8 logged change(s). Read the ledger before editing:
+# │     bin/core-changelog show bin/fleet_sql.py
+# │ Last: 2026-10-06T07:28Z · claude-seat · d301a0a5b · TARSUS-0 (J go 2026-10-06; plan (unpublished)...
+# └─────────────────────────────────────────────
 """
 fleet-sql — Custom Database Tool Middleware & Token Regulator
 Provides intelligent SQLite tool middleware with:
@@ -10,9 +15,9 @@ Provides intelligent SQLite tool middleware with:
 """
 
 import argparse
-import os
 import re
 import sqlite3
+import os
 import subprocess
 import sys
 import json
@@ -258,8 +263,12 @@ def execute_query(db_path: Path, sql: str, params: Tuple = (),
         return result
 
 
-# Release 0.1.0: alias directory is configurable (was a fixed fleet path). Default = <tool root>/control-center.
+# TARSUS-0 B1: one source for fleet + release. Alias dir = OMNITOOL_DB_DIR or <tool root>/control-center.
 _DB_DIR = Path(os.environ.get("OMNITOOL_DB_DIR") or Path(__file__).resolve().parent.parent / "control-center").expanduser()
+# Post-mutation hook: OMNITOOL_SQL_WRITE_HOOK, else <tool root>/bin/compile-telemetry when it exists (the fleet's
+# state-anchor compiler), else none.
+_SQL_WRITE_HOOK = os.environ.get("OMNITOOL_SQL_WRITE_HOOK") or str(Path(__file__).resolve().parent / "compile-telemetry")
+
 DB_ALIASES = {
     "dispatch": _DB_DIR / "dispatch.db",
     "tasks": _DB_DIR / "dispatch.db",
@@ -278,6 +287,22 @@ def _resolve_db(db_str: str) -> Path:
     """2026-09-26 dogfood: only `omni` honoured DB_ALIASES; `query dispatch ...` failed with
     'unable to open database file'. Every subcommand now resolves aliases the same way."""
     return DB_ALIASES[db_str] if db_str in DB_ALIASES else Path(db_str).expanduser()
+
+
+def _split_statements(sql: str) -> list:
+    """Split multi-statement SQL at real statement boundaries (sqlite3.complete_statement respects quotes and
+    trigger bodies). sqlite3's execute() takes ONE statement; a multi-statement op used to fail with
+    'You can only execute one statement at a time' (dogfood bug 96, 2026-10-01)."""
+    out, buf = [], ""
+    for part in sql.split(";"):
+        buf = f"{buf};{part}" if buf else part
+        if sqlite3.complete_statement(buf + ";"):
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return out
 
 
 def execute_omni_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -337,6 +362,17 @@ def execute_omni_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
             cur.execute("BEGIN IMMEDIATE")
             
         results = []
+        # Expand multi-statement strings (no params) into one op per statement, same transaction (bug 96).
+        expanded = []
+        for op in operations:
+            text = op if isinstance(op, str) else (op.get("sql", "") if isinstance(op, dict) else "")
+            has_params = isinstance(op, dict) and op.get("params")
+            parts = _split_statements(text) if (text and not has_params and ";" in text.strip().rstrip(";")) else None
+            if parts and len(parts) > 1:
+                expanded.extend(parts if isinstance(op, str) else [dict(op, sql=p_) for p_ in parts])
+            else:
+                expanded.append(op)
+        operations = expanded
         for idx, op in enumerate(operations):
             if isinstance(op, str):
                 sql = op.strip()
@@ -407,10 +443,8 @@ def execute_omni_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Trigger state anchor compilation if any mutations occurred
         if mode == "read_write" and any(r.get("type") == "mutation" for r in results):
             try:
-                # Release 0.1.0: optional post-mutation hook (was a fixed fleet script). Unset = no hook.
-                _hook = os.environ.get("OMNITOOL_SQL_WRITE_HOOK")
-                if _hook:
-                    subprocess.Popen([_hook], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if os.path.isfile(_SQL_WRITE_HOOK) and os.access(_SQL_WRITE_HOOK, os.X_OK):
+                    subprocess.Popen([_SQL_WRITE_HOOK], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 

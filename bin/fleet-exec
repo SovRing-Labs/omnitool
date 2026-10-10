@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ┌─ CORE FILE · governed by control-center/core-changelog.jsonl ──────────
+# │ ⚠  LOAD-BEARING. 31 logged change(s). Read the ledger before editing:
+# │     bin/core-changelog show bin/fleet-exec
+# │ Last: 2026-10-07T22:09Z · jc · d282c8907 · FLEET-TOOLS-COST-0: cut seat tool friction (~20 % of calls, Fleet...
+# └─────────────────────────────────────────────
+# TIER: kernel
+# OWNER: commander (Codex Law I)
+# MODEL-ROLE: none
 """
 fleet-exec -- Consolidated Omni-Tool Execution Engine with Parallel Pipelines
 
@@ -22,6 +30,7 @@ USAGE:
 """
 
 import asyncio
+import tempfile
 import hashlib
 import json
 import os
@@ -38,7 +47,7 @@ import asyncio
 import json as _json_mod
 import shlex # FIX: Explicitly import shlex for Dispatch Doctor
 
-# Import sister tools. AI_STACK = the tool root (the directory above bin/); default bash cwd.
+# Import sister tools
 AI_STACK = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(AI_STACK / "bin"))
 
@@ -53,16 +62,103 @@ MAX_CONCURRENT_TASKS = 8
 DEFAULT_TIMEOUT_S = 30
 # 2026-09-26 dogfood: 4000 chars cut normal outputs (gate runs, listings); tunable, default 16000.
 STDOUT_CAP = int(os.environ.get("FLEET_EXEC_STDOUT_CAP", "16000"))
+
+
+def _cap_stdout(text: str) -> str:
+    """TARSUS-0 A6: a capped stdout says so in-band; the `truncated` flag alone was stripped before callers saw it."""
+    if len(text) <= STDOUT_CAP:
+        return text
+    return text[:STDOUT_CAP] + f"\n… [stdout cut at {STDOUT_CAP} of {len(text)} chars — FLEET_EXEC_STDOUT_CAP, or write to a file]"
 MAX_READ_BYTES = 128 * 1024  # 128 KB safe read limit
 def compute_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
 # A2 (S2b 2026-09-25): write/patch targets must lie under a write scope.
-# Release 0.1.0: the default is the tool root and /tmp (the development tree listed its own home
-# directories here). Set FLEET_EXEC_WRITE_SCOPES=dir1:dir2 to name your project directories.
-_HOME = Path.home()
-_DEFAULT_WRITE_SCOPES = [AI_STACK, Path("/tmp")]
+# TARSUS-0 B1 (2026-10-06): ONE source for the fleet and the release. Scopes come from, in order:
+#   FLEET_EXEC_WRITE_SCOPES=dir1:dir2 (env) -> OMNITOOL_SCOPES_FILE or <tool root>/control-center/write-scopes.conf
+#   (one directory per line, ~ expanded, # comments) -> the tool root and /tmp. The fleet's list lives in that file
+#   (it mirrors opencode.jsonc permission.external_directory; bin/seat-tool-redirect reads the same file).
+_SCOPES_FILE = Path(os.environ.get("OMNITOOL_SCOPES_FILE") or (AI_STACK / "control-center" / "write-scopes.conf"))
+
+
+def _load_scopes_file(path: Path) -> List[Path]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [Path(l.split("#", 1)[0].strip()).expanduser() for l in lines if l.split("#", 1)[0].strip()]
+
+
+_DEFAULT_WRITE_SCOPES = _load_scopes_file(_SCOPES_FILE) or [AI_STACK, Path("/tmp")]
+
+
+# TARSUS-0 A3 (2026-10-06, review G1): bash ops run under Landlock (bin/tarsus_sandbox.py) so the kernel enforces
+# the write scopes for the whole process tree — before this, `echo x > /var/tmp/y` in a bash op wrote anywhere.
+# Policy: <tool root>/control-center/tarsus.conf (sandbox = enforce|best-effort|off, bash_extra_write = dirs);
+# env FLEET_EXEC_SANDBOX / FLEET_EXEC_BASH_EXTRA_WRITE override; FLEET_EXEC_WRITE_ANYWHERE=1 turns it off.
+# No conf file (fresh release checkout) -> best-effort.
+def _load_conf(path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+_CONF_PATH = Path(os.environ.get("TARSUS_CONF") or (AI_STACK / "control-center" / "tarsus.conf"))
+_SANDBOX_PY = Path(__file__).resolve().parent / "tarsus_sandbox.py"
+
+
+def _sandbox_argv(cmd: str) -> Optional[List[str]]:
+    """argv that runs `cmd` under the write-scope sandbox, or None when the sandbox is off."""
+    if os.environ.get("FLEET_EXEC_WRITE_ANYWHERE") == "1":
+        return None
+    conf = _load_conf(_CONF_PATH)   # read per call: editing tarsus.conf takes effect with no fleet-execd restart
+    mode = (os.environ.get("FLEET_EXEC_SANDBOX") or conf.get("sandbox") or "best-effort").lower()
+    if mode not in ("enforce", "best-effort") or not _SANDBOX_PY.is_file():
+        return None
+    env_scopes = os.environ.get("FLEET_EXEC_WRITE_SCOPES")
+    scopes = [Path(x).expanduser() for x in env_scopes.split(":") if x] if env_scopes else list(_DEFAULT_WRITE_SCOPES)
+    extra = os.environ.get("FLEET_EXEC_BASH_EXTRA_WRITE")
+    extra_dirs = extra.split(":") if extra is not None else conf.get("bash_extra_write", "").split()
+    argv = [sys.executable, "-S", str(_SANDBOX_PY), "--mode", mode]
+    for d in [*map(str, scopes), *extra_dirs]:
+        if d:
+            argv += ["--write", os.path.expanduser(d)]
+    return argv + ["--", "/bin/bash", "-c", cmd]
+
+
+def _prepend_path() -> None:
+    """tarsus.conf `bash_path_prepend` dirs go first on PATH for bash ops. fleet-execd runs from a systemd user unit with
+    the bare system PATH, so `fleet-kb` / `cargo` were "not found" in kernel bash (FLEET-TOOLS-COST-0 #2, 10-07)."""
+    dirs = [os.path.expanduser(d) for d in _load_conf(_CONF_PATH).get("bash_path_prepend", "").split()]
+    cur = os.environ.get("PATH", "/usr/bin:/bin").split(":")
+    add = [d for d in dirs if d not in cur and os.path.isdir(d)]
+    if add:
+        os.environ["PATH"] = ":".join(add + cur)
+
+
+def _sandbox_note(result: Dict[str, Any]) -> None:
+    """A sandboxed op that hit EACCES gets a one-line hint (and a dogfood row) instead of a bare 'Permission denied'."""
+    text = f"{result.get('stderr') or ''}\n{result.get('stdout') or ''}"
+    if result.get("ok") or "Permission denied" not in text:
+        return
+    result["sandbox_hint"] = ("writes outside the write scopes are blocked by the Landlock sandbox (control-center/"
+                              "write-scopes.conf + tarsus.conf bash_extra_write); `>/dev/stdout`/`>/dev/stderr` into a pipe "
+                              "is also denied — use >&1 / >&2")
+    try:
+        cc = AI_STACK / "control-center"
+        if cc.is_dir():
+            with open(cc / "sandbox-denials.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": time.time(), "line": next((l for l in text.splitlines() if "Permission denied" in l), "")[:300]}) + "\n")
+    except OSError:
+        pass
 
 
 def _write_scope_error(path_str: str) -> Optional[str]:
@@ -80,6 +176,15 @@ def _write_scope_error(path_str: str) -> Optional[str]:
     return f"path outside write scopes: {real} (allowed: {', '.join(str(s) for s in scopes)})"
 
 
+def _new_log_path(kind: str = "detach") -> str:
+    """A UNIQUE log file per detached op. The old name was /tmp/fleet-exec-<kind>-<ms>.log: two parallel ops that started
+    in the same millisecond shared one file — op 0 read op 1's output (mixed results) and then unlinked the shared log, so
+    op 1 returned only a dead log_path (dogfood bugs 80 / 98 / 100, 2026-10-01)."""
+    fd, path = tempfile.mkstemp(prefix=f"fleet-exec-{kind}-", suffix=".log", dir="/tmp")
+    os.close(fd)
+    return path
+
+
 async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
     cmd = args.get("command", "")
     if isinstance(cmd, dict):
@@ -88,6 +193,7 @@ async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
         return {"ok": False, "error": "command required"}
 
     cwd_early = args.get("cwd") or str(AI_STACK)
+    _prepend_path()
 
     if args.get("detach"):
         # Fire-and-forget: the outer MCP transport (Node execFileAsync) hard-
@@ -97,11 +203,12 @@ async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
         # closed (non-interactive opencode invocations hang reading an open
         # stdin pipe -- see bin/lane-verify's identical bug), output
         # redirected to a log file, and returns immediately without waiting.
-        log_path = args.get("log_path") or f"/tmp/fleet-exec-detach-{int(time.time()*1000)}.log"
+        log_path = args.get("log_path") or _new_log_path("detach")
         try:
             logf = open(log_path, "ab")
+            _sb = _sandbox_argv(cmd)
             proc = subprocess.Popen(
-                cmd, shell=True, executable="/bin/bash", cwd=cwd_early,
+                _sb or cmd, shell=_sb is None, executable=None if _sb else "/bin/bash", cwd=cwd_early,
                 stdin=subprocess.DEVNULL,
                 stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -120,11 +227,12 @@ async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
         # at timeout_s, in which case it is left running (never killed) and
         # a {status: still_running, pid, log_path} handle is returned so the
         # caller never blocks past its own budget.
-        log_path = args.get("log_path") or f"/tmp/fleet-exec-detach-{int(time.time()*1000)}.log"
+        log_path = args.get("log_path") or _new_log_path("detach")
         try:
             logf = open(log_path, "ab")
+            _sb = _sandbox_argv(cmd)
             proc2 = subprocess.Popen(
-                cmd, shell=True, executable="/bin/bash", cwd=cwd_early,
+                _sb or cmd, shell=_sb is None, executable=None if _sb else "/bin/bash", cwd=cwd_early,
                 stdin=subprocess.DEVNULL,
                 stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -145,8 +253,10 @@ async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
                 except Exception:
                     out_text2 = ""
                 if out_text2:
-                    result2["stdout"] = out_text2[:STDOUT_CAP]
+                    result2["stdout"] = _cap_stdout(out_text2)
                     result2["truncated"] = len(out_text2) > STDOUT_CAP
+                if _sb:
+                    _sandbox_note(result2)
                 # Auto-promoted op finished inside its budget: output is inline, the log is litter.
                 if args.get("_auto_detach") and not args.get("log_path") and not result2.get("truncated"):
                     try:
@@ -167,13 +277,18 @@ async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
     cwd = cwd_early
     start = time.time()
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            executable="/bin/bash",   # 2026-09-26 dogfood: was /bin/sh; bash-only syntax needed a Doctor re-run
-        )
+        _sb = _sandbox_argv(cmd)
+        if _sb:
+            proc = await asyncio.create_subprocess_exec(
+                *_sb, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd)
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                executable="/bin/bash",   # 2026-09-26 dogfood: was /bin/sh; bash-only syntax needed a Doctor re-run
+            )
         stdout_raw, stderr_raw = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         duration_ms = round((time.time() - start) * 1000, 2)
         out_text = stdout_raw.decode("utf-8", errors="replace")
@@ -184,16 +299,17 @@ async def op_bash(args: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
 
         if not ok:
             # Failure: always return full output for debugging
-            result["stdout"] = out_text[:STDOUT_CAP]
+            result["stdout"] = _cap_stdout(out_text)
             result["stderr"] = err_text[:2000] if err_text else None
             result["truncated"] = len(stdout_raw) > STDOUT_CAP
         else:
             if out_text:
-                result["stdout"] = out_text[:STDOUT_CAP]
+                result["stdout"] = _cap_stdout(out_text)
                 result["truncated"] = len(stdout_raw) > STDOUT_CAP
             if err_text:
                 result["stderr"] = err_text[:2000]
-
+        if _sb:
+            _sandbox_note(result)
         return result
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"Command timed out after {timeout_s}s", "exit_code": -1, "duration_ms": round((time.time() - start) * 1000, 2)}
@@ -224,16 +340,21 @@ async def op_read(args: Dict[str, Any]) -> Dict[str, Any]:
                 "sha256": file_hash, "bytes": len(raw_bytes), "duration_ms": round((time.time() - start) * 1000, 2)
             }
 
-        truncated = len(raw_bytes) > MAX_READ_BYTES
-        view_bytes = raw_bytes[:MAX_READ_BYTES]
-        text_content = view_bytes.decode("utf-8", errors="replace")
-
+        # full=True (KERNEL-DOGFOOD-1, bug #130): read-modify-write callers (MCP edit) need the WHOLE file;
+        # the 128 KB view cap silently cut a 150 KB layout.rs to 131,081 B on edit write-back.
+        # lossless=False means the bytes were not valid UTF-8 (U+FFFD substituted) -- unsafe to write back.
+        truncated = (not args.get("full")) and len(raw_bytes) > MAX_READ_BYTES
+        view_bytes = raw_bytes[:MAX_READ_BYTES] if truncated else raw_bytes
+        try:
+            text_content, lossless = view_bytes.decode("utf-8"), True
+        except UnicodeDecodeError:
+            text_content, lossless = view_bytes.decode("utf-8", errors="replace"), False
 
         return {
             "ok": True, "path": str(p),
             "status": "modified" if client_hash else "read",
             "sha256": file_hash, "bytes": len(raw_bytes),
-            "truncated": truncated, "content": text_content,
+            "truncated": truncated, "lossless": lossless, "content": text_content,
             "duration_ms": round((time.time() - start) * 1000, 2)
         }
     except Exception as e:
@@ -540,6 +661,35 @@ async def op_glob(args: Dict[str, Any]) -> Dict[str, Any]:
             "duration_ms": round((time.time() - start) * 1000, 2)}
 
 
+async def op_show(args: Dict[str, Any]) -> Dict[str, Any]:
+    """ATTENTION-SURFACE D (2026-10-02): the agent turns its screen toward J — `{"type":"show","path":p,
+    "lines":"40-60"?, "why":"..."}`. Read-only; returns the excerpt; the field mark (kind=read, outcome=show,
+    detail {why, lines}) is what the attention feed raises."""
+    p = Path(os.path.expanduser(str(args.get("path") or ""))).resolve()
+    if not p.is_file():
+        return {"ok": False, "error": f"file not found: {p}"}
+    lines = str(args.get("lines") or "")
+    try:
+        text = p.read_text(errors="replace").splitlines()
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    a, b = 1, min(len(text), 80)
+    if lines:
+        try:
+            a, _, b2 = lines.partition("-")
+            a, b = max(int(a), 1), int(b2 or a)
+        except ValueError:
+            return {"ok": False, "error": f"lines must be 'A-B' or 'A', got {lines!r}"}
+    excerpt = "\n".join(f"{i}\t{t}" for i, t in enumerate(text[a - 1:b], start=a))
+    return {"ok": True, "path": str(p), "lines": f"{a}-{b}", "why": str(args.get("why") or "")[:300],
+            "excerpt": excerpt[:8000]}
+
+
+def _snap_path(op: Dict[str, Any]) -> Optional[Path]:
+    p = op.get("path") or op.get("target")
+    return Path(os.path.expanduser(str(p))).resolve() if p else None
+
+
 async def op_grep(args: Dict[str, Any]) -> Dict[str, Any]:
     """Regex search via ripgrep (grep -rn fallback). Read-only; max 300 matching lines."""
     start = time.time()
@@ -573,7 +723,7 @@ async def op_sql(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"SQL execution failed: {e}", "type": "sql"}
 
 
-ALLOWED_OP_TYPES = ("bash", "read", "write", "patch", "sql", "db_exec", "omni_sql", "fix_json", "glob", "grep")
+ALLOWED_OP_TYPES = ("bash", "read", "write", "patch", "sql", "db_exec", "omni_sql", "fix_json", "glob", "grep", "show")
 # (field, expected python types) — checked only when the field is present-required;
 # a missing required field is its own error, reported once per operation.
 REQUIRED_ARGS = {
@@ -586,6 +736,7 @@ REQUIRED_ARGS = {
     "fix_json": [("path", str)],
     "glob": [("pattern", str)],
     "grep": [("pattern", str)],
+    "show": [("path", str)],
 }
 
 
@@ -633,6 +784,16 @@ def validate_payload(payload: Dict[str, Any]) -> List[str]:
                 errors.append(f"op[{idx}]: missing '{field}'")
         if op_type == "write" and "content" not in op:
             errors.append(f"op[{idx}]: missing 'content'")
+        # Write scopes are part of structural validation (dogfood bug 97, 2026-10-01): a refused write used to be found
+        # only at run time, after sibling ops had already run — the batch was half-applied. Now the batch is refused whole.
+        if op_type in ("write", "patch", "fix_json"):
+            for fld in ("path", "target"):
+                tgt = op.get(fld)
+                if isinstance(tgt, str) and tgt:
+                    full = tgt if os.path.isabs(os.path.expanduser(tgt)) else str(AI_STACK / tgt)
+                    scope_err = _write_scope_error(full)
+                    if scope_err:
+                        errors.append(f"op[{idx}]: {scope_err}")
         if op_type in ("sql", "db_exec", "omni_sql"):
             sql_ops = op.get("operations") or op.get("queries")
             if sql_ops is not None and not isinstance(sql_ops, list):
@@ -776,7 +937,10 @@ def _compute_delay(attempt: int, category: str) -> float:
 
 
 # ── Omnibreak circuit-breaker wiring (F5) ────────────────────────────
-_OMNIBREAK_DB = os.environ.get("OMNIBREAK_DB") or str(Path(__file__).resolve().parent / "omnibreak.db")  # release 0.1.0: env override
+# W0-1 (CLAUDE-DISPERSAL, 2026-10-02): runtime DB in control-center/ (sandbox-shared), not bin/ — the bin/ copy
+# made every sandboxed worker's settle CONFLICT. Migrated once by claude-seat (sqlite backup, 2 breaker rows).
+_CC_DIR = Path(__file__).resolve().parent.parent / "control-center"
+_OMNIBREAK_DB = os.environ.get("OMNIBREAK_DB") or str((_CC_DIR if _CC_DIR.is_dir() else Path(__file__).resolve().parent) / "omnibreak.db")
 _BREAK_WARN = 2   # warn after this many consecutive fails for same key
 _BREAK_TRIP = 3   # abort/trigger breaker at this count
 
@@ -959,10 +1123,32 @@ async def dispatch_single(op: Dict[str, Any], default_timeout: float = DEFAULT_T
             return await op_glob(op)
         elif op_type == "grep":
             return await op_grep(op)
+        elif op_type == "show":
+            return await op_show(op)
         else:
             return {"ok": False, "error": f"Unsupported operation type: {op_type}"}
 
+    # ATTENTION-SURFACE C1 (2026-10-02): before/after images for file writes -> field mark detail ->
+    # revert (weaver/attention.py, compare-and-swap on sha_after). Fail-open: capture never blocks a write.
+    _snap = None
+    if op_type in ("write", "patch", "fix_json") and os.environ.get("FLEET_EXEC_SNAPSHOT", "1") != "0":
+        try:
+            sys.path.insert(0, str(AI_STACK / "weaver"))
+            import blobs as _blobs
+            _sp = _snap_path(op)
+            if _sp is not None:
+                _b = _blobs.snapshot(_sp)
+                _snap = {"path": str(_sp), "sha_before": _b["sha"], "before_stored": _b["stored"]}
+        except Exception:
+            _snap = None
     result = await _execute()
+    if _snap is not None and isinstance(result, dict):
+        try:
+            _a = _blobs.snapshot(_snap["path"])
+            _snap.update(sha_after=_a["sha"], bytes=_a["bytes"], after_stored=_a["stored"])
+            result["_snap"] = _snap
+        except Exception:
+            pass
     _omnibreak_record(op_type, op_hash, result.get("ok", False), result.get("error", ""))
     result.setdefault("_key_hash", op_hash)
     
@@ -1071,6 +1257,9 @@ def _compact_result(r: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(sub, dict):
                 # Drop noise keys from each sub-result
                 clean = {k: v for k, v in sub.items() if k not in skip}
+                # A capped read is a correctness signal, not noise (bug #130: callers could not see the cut).
+                if sub.get("truncated"):
+                    clean["truncated"], clean["bytes"] = True, sub.get("bytes")
 
                 # Rows are already bounded by fleet_sql's LIMIT (default 5, explicit <=200).
                 # 2026-09-26 dogfood: this used to cut to rows_first[:3] on top of that, so an
@@ -1301,6 +1490,82 @@ async def run_pipeline_stream(payload: Dict[str, Any]) -> Dict[str, Any]:
     return final
 
 
+# ── TARSUS-0 C2 (2026-10-06): per-operation audit stream ─────────────────────────────────────────────────────────
+# One JSON line per operation in the OpenTelemetry log data model (Timestamp, SeverityText, Body, TraceId, SpanId,
+# Attributes, Resource), so an OTel Collector `filelog` receiver (json_parser) ships it to any backend unchanged —
+# no network in the hot path. Who (enduser.id, session, task, role), what (type, fingerprint, input hash, optional
+# summary), the guard's decision (level, rules, who approved), the sandbox mode, and the outcome. Enabled by
+# tarsus.conf `audit = <path>` (or env TARSUS_AUDIT; `off` disables); `audit_detail = hash` (default: no command
+# text) | summary (first 200 chars). Refused batches are logged too (outcome not_run). Reader: `tarsus audit`.
+def _record_audit(payload: Dict[str, Any], result: Dict[str, Any]) -> None:
+    conf = _load_conf(_CONF_PATH)
+    path = os.environ.get("TARSUS_AUDIT") or conf.get("audit") or ""
+    if not path or path == "off" or not isinstance(result, dict):
+        return
+    try:
+        import hashlib, socket as _sock
+        detail = (os.environ.get("TARSUS_AUDIT_DETAIL") or conf.get("audit_detail") or "hash").lower()
+        ops = payload.get("operations") or payload.get("tasks") or []
+        guard = payload.get("_guard") or []
+        res = result.get("results") or []
+        refused = bool(result.get("errs")) and not res
+        now_ns = time.time_ns()
+        trace = hashlib.sha256(f"{now_ns}{os.getpid()}{id(payload)}".encode()).hexdigest()[:32]
+        mode = (os.environ.get("FLEET_EXEC_SANDBOX") or conf.get("sandbox") or "best-effort").lower()
+        actor = {k: v for k, v in {
+            "enduser.id": os.environ.get("USER") or os.environ.get("LOGNAME"),
+            "tarsus.actor.session": os.environ.get("TARSUS_SESSION") or os.environ.get("TALON_SESSION"),
+            "tarsus.actor.task": os.environ.get("TALON_TASK_ID"),
+            "tarsus.actor.role": os.environ.get("TALON_ROLE"),
+        }.items() if v}
+        lines = []
+        for i, op in enumerate(ops if isinstance(ops, list) else []):
+            if not isinstance(op, dict):
+                continue
+            g = guard[i] if i < len(guard) and isinstance(guard[i], dict) else {}
+            r = res[i] if i < len(res) and isinstance(res[i], dict) else {}
+            level = g.get("level", "ok")
+            ok = None if refused else bool(r.get("ok"))
+            denied = "sandbox_hint" in r
+            sev = "ERROR" if (refused or level == "block" and not g.get("approved") or ok is False) else \
+                  "WARN" if (level == "warn" or denied or g.get("approved")) else "INFO"
+            attrs = {
+                "tarsus.op.index": i, "tarsus.op.type": op.get("type"),
+                "tarsus.op.fingerprint": omnitool_guard.op_fingerprint(op),
+                "tarsus.op.input_sha256": hashlib.sha256(json.dumps(op, sort_keys=True, default=str).encode()).hexdigest(),
+                "tarsus.guard.level": level,
+                "tarsus.guard.rules": [x.get("id") for x in g.get("rules", [])],
+                "tarsus.sandbox.mode": mode if op.get("type") == "bash" else None,
+                "tarsus.outcome": "not_run" if refused else ("ok" if ok else "failed"),
+                "tarsus.outcome.exit_code": r.get("exit_code"),
+                "tarsus.outcome.duration_ms": r.get("duration_ms"),
+                "tarsus.outcome.sandbox_denied": denied or None,
+                **actor,
+            }
+            if g.get("approved"):
+                attrs["tarsus.guard.approved_by"] = g["approved"].get("by")
+            if detail == "summary":
+                attrs["tarsus.op.summary"] = str(op.get("command") or op.get("path") or op.get("target") or
+                                                 op.get("sql") or op.get("query") or "")[:200]
+            lines.append(json.dumps({
+                "Timestamp": now_ns, "SeverityText": sev,
+                "Body": f"{op.get('type')} {level}{' approved' if g.get('approved') else ''} -> {attrs['tarsus.outcome']}",
+                "TraceId": trace, "SpanId": hashlib.sha256(f"{trace}{i}".encode()).hexdigest()[:16],
+                "Attributes": {k: v for k, v in attrs.items() if v is not None},
+                "Resource": {"service.name": "tarsus", "service.version": "0.2.0", "host.name": _sock.gethostname()},
+            }, default=str))
+        if lines:
+            p = Path(os.path.expanduser(path))
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(p), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, ("\n".join(lines) + "\n").encode())      # one write per batch: lines stay whole
+            finally:
+                os.close(fd)
+    except Exception:
+        pass   # auditing must never break execution
+
+
 def _record_field_marks(payload: Dict[str, Any], result: Dict[str, Any]) -> None:
     """Stigmergy (STIGMERGY-LOOP 2026-09-27): every act leaves a mark in the Weaver field
     (~/.weaver/control-center/field.sqlite) — file for write/patch, command for bash, db for sql
@@ -1330,7 +1595,12 @@ def _record_field_marks(payload: Dict[str, Any], result: Dict[str, Any]) -> None
         outcome = "ok" if r.get("ok") else "fail"
         if t in ("write", "patch", "fix_json"):
             p = op.get("path") or op.get("target") or r.get("path") or ""
-            rows.append({"kind": "file", "target": str(Path(os.path.expanduser(p)).resolve()) if p else "(patch)", "outcome": outcome})
+            rows.append({"kind": "file", "target": str(Path(os.path.expanduser(p)).resolve()) if p else "(patch)", "outcome": outcome,
+                         "detail": r.get("_snap")})
+        elif t == "show" and r.get("ok"):
+            rows.append({"kind": "read", "target": r.get("path", ""), "outcome": "show", "weight": 1.0,
+                         "detail": {"why": r.get("why", ""), "lines": r.get("lines", ""),
+                                    "excerpt": str(r.get("excerpt", ""))[:3000]}})
         elif t == "bash":
             rows.append({"kind": "command", "target": str(op.get("command", ""))[:300], "outcome": outcome, "weight": 0.5})
         elif t in ("sql", "db_exec", "omni_sql") and op.get("mode") == "read_write":
@@ -1338,6 +1608,182 @@ def _record_field_marks(payload: Dict[str, Any], result: Dict[str, Any]) -> None
         elif t == "read" and op.get("path"):
             rows.append({"kind": "read", "target": str(Path(os.path.expanduser(op["path"])).resolve()), "outcome": outcome, "weight": 0.3})
     _field.record_many(rows, source="fleet-exec")
+
+
+def _area_components(target: str, n: int = 3) -> str:
+    """First ``n`` path components of ``target`` — mirror of omniring_areas._components.
+
+    This is a deliberate port, not a reimplementation of the idea: the ring's
+    area key is a contract between this file and
+    ``sidecar/launcher_core/omniring_areas.py`` and the two MUST agree on it.
+    The ring module cannot simply be imported here — it builds two 10240-dim
+    ternary prototypes and a MarkStore at import time, which is hundreds of ms
+    of numpy to add to a hot path that runs on every tool call, plus a hard
+    cross-repo import of ~/projects from the ai-stack spine. So the ~20 lines of
+    pure string logic are mirrored here, and ``tests/test_omark_wire.py`` asserts
+    this port against the real ``area_of`` over a corpus so the two cannot drift
+    silently. Fix, when the ring is next touched: hoist ``area_of`` into a
+    stdlib-only module both sides import.
+    """
+    import re
+    text = str(target or "").strip()
+    if text.startswith("file:"):
+        text = text[len("file:"):]
+    else:
+        text = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", text)
+    if not text:
+        return "(empty)"
+    absolute = text.startswith("/")
+    parts = [p for p in text.split("/") if p]
+    if not parts:
+        return "/"
+    head = "/".join(parts[:n])
+    return f"/{head}" if absolute else head
+
+
+def _area_first_path_arg(tokens: List[str]) -> Optional[str]:
+    """First path-looking argument after the command word, else None.
+
+    Mirrors omniring_areas._first_path_arg: a bare word is far more often a
+    subcommand or a flag than a path (``git commit -m msg``), so only tokens
+    carrying a separator or a leading dot count.
+    """
+    import re
+    quotes = "\"'`"
+    for tok in tokens[1:]:
+        tok = tok.strip(quotes)
+        tok = re.split(r"[;|&<>`]", tok, 1)[0]
+        if not tok or tok.startswith("-"):
+            continue
+        if "/" in tok or tok.startswith("."):
+            return tok
+    return None
+
+
+def _area_key(kind: str, target: str) -> str:
+    """The ring's area key for one op — mirror of omniring_areas.area_of.
+
+    Only the pre-executable kinds are addressable here. A ``violation`` area is
+    keyed off the guard rules that fired, which is not knowable until the
+    payload is classified, so this returns "" for it and the area is simply not
+    warned about -- correctly, since a violation has not happened yet.
+    """
+    k = str(kind or "").strip().lower()
+    text = str(target or "").strip()
+    if k == "command":
+        tokens = text.split()
+        if not tokens:
+            return "command:(empty)"
+        arg = _area_first_path_arg(tokens)
+        return f"{tokens[0]}:{_area_components(arg)}" if arg else tokens[0]
+    if k in ("file", "read", "db", "doc", "note"):
+        return _area_components(text) or "(empty)"
+    return ""
+
+
+def _area_op_targets(payload: Dict[str, Any]) -> List[Tuple[int, str, str]]:
+    """``(op index, kind, target)`` per op, using _record_field_marks' own mapping.
+
+    Deliberately the same kind/target the mark will carry, so the key computed
+    here is the key the ring will file the outcome under. If these two ever
+    disagree the warning points at a different area than the one that later
+    records the failure, so the mapping lives in one function and is reused.
+    """
+    out: List[Tuple[int, str, str]] = []
+    ops = payload.get("operations") or payload.get("tasks") or []
+    for i, op in enumerate(ops):
+        if not isinstance(op, dict):
+            continue
+        t = op.get("type") or op.get("tool")
+        if t in ("write", "patch", "fix_json"):
+            p = op.get("path") or op.get("target") or ""
+            out.append((i, "file", str(Path(os.path.expanduser(p)).resolve()) if p else "(patch)"))
+        elif t == "bash":
+            out.append((i, "command", str(op.get("command", ""))[:300]))
+        elif t in ("sql", "db_exec", "omni_sql") and op.get("mode") == "read_write":
+            out.append((i, "db", str(op.get("database") or "dispatch")))
+        elif t == "read" and op.get("path"):
+            out.append((i, "read", str(Path(os.path.expanduser(op["path"])).resolve())))
+    return out
+
+
+def _area_index(timeout: float) -> Dict[str, Dict[str, Any]]:
+    """``area -> {resonance, count}`` from the ring's already-published state.
+
+    The sidecar owns the ring; this only reads it. That split is the point:
+    building a second MarkStore here would put a ~5 MB allocation and a full
+    field.sqlite scan on a path that runs on every single tool call.
+    """
+    import urllib.request
+    url = os.environ.get("OMNIRING_STATE_URL", "http://127.0.0.1:47811")
+    with urllib.request.urlopen(url.rstrip("/") + "/omniring/state", timeout=timeout) as resp:
+        state = json.loads(resp.read().decode())
+    rows = (state or {}).get("areas") or []
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        area = str(row.get("area") or "")
+        if not area:
+            continue
+        try:
+            index[area] = {"resonance": float(row.get("resonance") or 0.0),
+                           "count": int(row.get("count") or 0),
+                           "age_s": row.get("age_s")}
+        except (TypeError, ValueError):
+            continue
+    return index
+
+
+def _area_warning(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Advisory: "this area has been failing", from the omniring area resonance.
+
+    OMARK-WIRE, 2026-09-29. OMARK-AREA pre-registered PREDICTS (AUC 0.7064 all /
+    0.7472 warm on held-out days; areas below resonance -0.2 failed at >=2x the
+    base rate). This is that measurement spent as a warning and nothing more.
+
+    FAIL-OPEN, BY CONSTRUCTION, AND IT MUST STAY THAT WAY:
+      * every path returns a list; the caller ignores it on any error;
+      * no return code, no exception, no control-flow branch touches ``ok``;
+      * the ring is read, never written, and never required -- sidecar down,
+        state malformed, key unresolvable all mean "no warning", not "stop";
+      * cold areas (count 0) are never warned about: a resonance of 0.0 for an
+        area with no evidence is a cold start, not a healthy one, and warning on
+        it would be a false positive on the very first call in a new area.
+
+    Env: FLEET_EXEC_AREA_WARN=0 off | FLEET_EXEC_AREA_RESONANCE (default -0.2,
+    the pre-registered 2x-lift threshold) | FLEET_EXEC_AREA_MIN_MARKS (default 3,
+    the warm-evidence floor) | FLEET_EXEC_AREA_TIMEOUT (default 0.35s).
+    """
+    if os.environ.get("FLEET_EXEC_AREA_WARN", "1") == "0":
+        return []
+    try:
+        res_max = float(os.environ.get("FLEET_EXEC_AREA_RESONANCE", "-0.2"))
+        min_marks = int(os.environ.get("FLEET_EXEC_AREA_MIN_MARKS", "3"))
+        timeout = float(os.environ.get("FLEET_EXEC_AREA_TIMEOUT", "0.35"))
+        index = _area_index(timeout)
+        if not index:
+            return []
+        warns: List[Dict[str, Any]] = []
+        for i, kind, target in _area_op_targets(payload):
+            area = _area_key(kind, target)
+            if not area:
+                continue
+            hit = index.get(area)
+            if not hit:
+                continue  # ring has no slot for it: cold, nothing to say
+            if hit["count"] < min_marks:
+                continue  # too little evidence to accuse an area of anything
+            if hit["resonance"] > res_max:
+                continue
+            warns.append({"op": i, "kind": kind, "area": area,
+                          "resonance": hit["resonance"], "count": hit["count"]})
+        return warns
+    except Exception:
+        # Advisory only. A sidecar that is down, a state payload that changed
+        # shape, a float that stopped parsing — none of it is the caller's
+        # problem, and none of it may become a failed tool call.
+        return []
 
 
 def main():
@@ -1398,9 +1844,8 @@ def main():
     # Priority: C++ Unix socket -> Python HTTP daemon -> local classifier
     def _call_intent_daemon(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Call the BERT classifier; priority: C++ Unix socket -> Python HTTP -> local.
-        Release 0.1.0: FLEET_EXEC_CLASSIFIER=off skips all tiers (the advisory label is then
-        unrated; the deterministic guard still decides safety). OMNITOOL_INTENT_URL overrides
-        the daemon address (default http://127.0.0.1:8498)."""
+        FLEET_EXEC_CLASSIFIER=off skips all tiers (the advisory label is then unrated; the deterministic guard
+        still decides safety). OMNITOOL_INTENT_URL overrides the daemon address (default http://127.0.0.1:8498)."""
         if os.environ.get("FLEET_EXEC_CLASSIFIER", "on").lower() in ("off", "0", "false"):
             return {"intent": None, "safety": None, "safety_confidence": 0, "classifier": "off"}
         # 1. C++ Unix socket — OFF the production path (2026-09-26): omnitool-bert-server is an
@@ -1448,10 +1893,13 @@ def main():
         except Exception:
             pass  # Fall through
 
-        # 3. Fallback: local classifier (cold, ~2.5s first time)
+        # 3. Fallback: local classifier — OFF by default (DL-omnitool-20, 2026-10-02): under load the
+        # in-process torch + MiniLM load measured ~50 s, stalling every batch for an advisory label
+        # (safety = omnitool_guard). Opt in with FLEET_EXEC_LOCAL_CLASSIFIER=1.
+        if __import__("os").environ.get("FLEET_EXEC_LOCAL_CLASSIFIER") != "1":
+            return None
         try:
-            # (release 0.1.0: the local `import os` here was removed -- it made `os` function-local,
-            # which would break the module-level os use added above; os is imported at module top.)
+            # (no local `import os`: it would make `os` function-local and break the os.environ uses above)
             os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
             os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
             import warnings
@@ -1506,6 +1954,19 @@ def main():
     except Exception:
         pass  # Non-fatal
 
+    # OMARK-WIRE: consult the omniring area resonance BEFORE anything runs --
+    # the whole value of a prediction is that it lands ahead of the failure.
+    # Pure advisory: the list goes to stderr and onto the result, and no
+    # branch below reads it to decide whether an op may proceed.
+    _awarns = _area_warning(payload)
+    for _w in _awarns:
+        sys.stderr.write(
+            f"[AREA-WARN] op[{_w['op']}] area={_w['area']} "
+            f"resonance={_w['resonance']:+.3f} ({_w['count']} marks in this area)\n"
+        )
+    if _awarns:
+        sys.stderr.flush()
+
     if args.validate_only:
         errors = validate_payload(payload)
         result = {"ok": not errors, "errs": errors}
@@ -1521,7 +1982,7 @@ def main():
         # This is how a chain of ops that must run one-after-another gets to
         # fire in the background without the caller waiting on any of it.
         inner_payload = {k: v for k, v in payload.items() if k != "detach"}
-        log_path = payload.get("log_path") or f"/tmp/fleet-exec-batch-{int(time.time()*1000)}.log"
+        log_path = payload.get("log_path") or _new_log_path("batch")
         try:
             logf = open(log_path, "ab")
             proc = subprocess.Popen(
@@ -1575,6 +2036,13 @@ def main():
             result["_intent"] = intent_data
 
     _record_field_marks(payload, result)
+    _record_audit(payload, result)
+
+    # Surface the area advisory in the result for the same reason _guard is
+    # surfaced below: an agent acting on this result should be able to read
+    # why it was flagged, not just find a warning in a log it may never see.
+    if _awarns and isinstance(result, dict):
+        result["_area_warnings"] = _awarns
 
     # Audit trail append
     if args.audit_trail:

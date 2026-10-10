@@ -14,6 +14,13 @@ import pytest
 BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN_DIR))
 
+# TARSUS-0 A4: blocked ops record a pending approval row; tests must never write the real ~/.config/tarsus/approvals
+# (it is what a human reads with `tarsus-approve`). Set before any guard import; inherited by fleet-exec subprocesses.
+import os as _os
+import tempfile as _tempfile
+_os.environ.setdefault("TARSUS_APPROVAL_DIR", _tempfile.mkdtemp(prefix="omnitool-test-approvals-"))
+_os.environ.setdefault("TARSUS_AUDIT", "off")   # C2: tests never write the real audit stream (test_audit passes its own)
+
 BERT_SOCKET = "/tmp/omnitool_bert.sock"
 DAEMON_URL = "http://127.0.0.1:8498"
 
@@ -66,11 +73,18 @@ def bert_socket_request(payload: dict, timeout: float = 3.0) -> dict:
 
 
 @pytest.fixture(autouse=True)
+def _isolated_field(tmp_path, monkeypatch):
+    """fleet-exec writes stigmergy marks (2026-09-27); tests must never touch the live field."""
+    monkeypatch.setenv("FIELD_DB", str(tmp_path / "field.sqlite"))
+    monkeypatch.setenv("FLEET_EXEC_MARKS", "1")      # floor-check turns marks off for live probes
+
+
+# Converged from the release conftest (TARSUS-0 B1, 2026-10-06): hermetic by default in BOTH the dev tree and the export.
+@pytest.fixture(autouse=True)
 def _isolated_env(tmp_path, monkeypatch):
-    """Every test runs against private state: its own SQL alias directory (with an empty
-    dispatch.db so the default `database` alias resolves), its own omnibreak-free env, no
-    stigmergy marks, and the advisory embedding classifier off (the deterministic guard
-    still runs; tests/test_classifier.py exercises the classifier directly)."""
+    """Every test runs against private state: its own SQL alias directory (with an empty dispatch.db so the default
+    `database` alias resolves), its own omnibreak DB, no stigmergy marks / snapshots, and the advisory embedding
+    classifier off (the deterministic guard still runs; test_classifier.py exercises the classifier directly)."""
     import sqlite3
     db_dir = tmp_path / "control-center"
     db_dir.mkdir()
@@ -79,4 +93,5 @@ def _isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("OMNIBREAK_DB", str(tmp_path / "omnibreak.db"))
     monkeypatch.setenv("FIELD_DB", str(tmp_path / "field.sqlite"))
     monkeypatch.setenv("FLEET_EXEC_MARKS", "0")
+    monkeypatch.setenv("FLEET_EXEC_SNAPSHOT", "0")
     monkeypatch.setenv("FLEET_EXEC_CLASSIFIER", "off")

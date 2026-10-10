@@ -1,0 +1,60 @@
+# Tarsus release: test, package, SBOM, checksums, Sigstore signatures — attached to the GitHub release.
+# Runs when a release is PUBLISHED (J creates it from the v* tag, body = NOTES.md). Signing is keyless: the
+# signature is bound to THIS workflow's identity via GitHub OIDC and logged in the public Sigstore transparency log
+# (the log records the repository + workflow, not a person). Actions are pinned to commit SHAs (2026-10-06).
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write      # attach assets to the release
+  id-token: write      # GitHub OIDC token for keyless Sigstore signing
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020   # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ripgrep patch
+          python -m pip install --quiet pytest
+          cd mcp && npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Test (guard selftest, pytest, node:test)
+        run: make test
+
+      - name: Package, SBOM, checksums
+        run: |
+          VER="${TAG#v}"
+          git archive --format=tar.gz --prefix="tarsus-${VER}/" -o "tarsus-${VER}.tar.gz" "$TAG"
+          python bin/tarsus-sbom --version "$VER" > "tarsus-${VER}.cdx.json"
+          sha256sum "tarsus-${VER}.tar.gz" "tarsus-${VER}.cdx.json" > SHA256SUMS
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+
+      - name: Attach release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "tarsus-${VER}.tar.gz" "tarsus-${VER}.cdx.json" SHA256SUMS --clobber
+
+      - name: Sign (Sigstore, keyless) and attach the signature bundles
+        uses: sigstore/gh-action-sigstore-python@790bc6befb9d733738f18d8f895854b453640ec9   # v3.5.0
+        with:
+          inputs: tarsus-${{ env.VER }}.tar.gz tarsus-${{ env.VER }}.cdx.json SHA256SUMS
+          release-signing-artifacts: true

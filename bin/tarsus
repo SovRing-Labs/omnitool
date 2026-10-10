@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""tarsus — set up and check Tarsus for an MCP client (TARSUS-0 B2, 2026-10-06).
+
+    tarsus doctor                          check prerequisites (python, node, rg, patch, git, Landlock, MCP SDK, daemon)
+    tarsus init [--project DIR]...         write the per-user policy (~/.config/tarsus/{write-scopes.conf,tarsus.conf})
+                [--client NAME] [--write]  and print the MCP client entry; --write merges it into the client's config
+    tarsus approve [FP]                    the human approval channel (same as tarsus-approve)
+    tarsus policy show | check '<payload>'  the effective policy / what the guard would decide (nothing runs)
+    tarsus audit [--since 1h] [--min-severity WARN] [--task T] [--stats]   read the per-operation audit stream
+
+Clients: claude-code (<project>/.mcp.json), claude-desktop (~/.config/Claude/claude_desktop_config.json),
+opencode (~/.config/opencode/opencode.json), print (default: just print the JSON). Nothing is written to a client
+config without --write; an existing entry named "tarsus" is replaced, every other entry is kept.
+"""
+import argparse
+import ctypes
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if not (ROOT / "bin" / "fleet-exec").exists():          # fleet tree: bin/tarsus -> projects/omnitool/bin/tarsus
+    ROOT = next((p for p in Path(__file__).absolute().parents if (p / "bin" / "fleet-exec").exists()), ROOT)
+CONF_DIR = Path(os.environ.get("TARSUS_CONFIG_DIR") or "~/.config/tarsus").expanduser()
+SERVER = ROOT / "mcp" / "src" / "tarsus-server.js"
+if not SERVER.exists():                                  # fleet tree layout
+    SERVER = ROOT / "mcp" / "sovereign-mcp-server" / "src" / "tarsus-server.js"
+
+DEFAULT_EXTRA = "~/.cache ~/.cargo ~/.rustup ~/.npm ~/.local/share ~/.local/state"
+
+
+def find_node():
+    """(path, major) of the newest node >= 22: PATH first, then nvm installs. The MCP server needs >= 22; a system
+    node is often older (this host: /usr/bin/node v18 while nvm has v22), and a client config must name the right one."""
+    import glob
+    cands = [shutil.which("node")] + sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/v*/bin/node")), reverse=True)
+    best = (None, 0)
+    for c in filter(None, cands):
+        try:
+            major = int(subprocess.run([c, "--version"], capture_output=True, text=True, timeout=5).stdout.strip().lstrip("v").split(".")[0])
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        if major > best[1]:
+            best = (c, major)
+    return best
+
+
+def landlock_abi() -> int:
+    try:
+        return ctypes.CDLL(None, use_errno=True).syscall(444, None, 0, 1)
+    except Exception:
+        return -1
+
+
+def doctor() -> int:
+    checks = []
+    def chk(name, ok, detail=""):
+        checks.append((name, ok, detail))
+    chk("python >= 3.10", sys.version_info >= (3, 10), sys.version.split()[0])
+    node, major = find_node()
+    chk("node >= 22 (MCP server)", major >= 22, f"{node} (v{major})" if node else "missing")
+    for tool in ("bash", "rg", "patch", "git"):
+        chk(tool, bool(shutil.which(tool)), shutil.which(tool) or "missing")
+    abi = landlock_abi()
+    chk("Landlock (bash sandbox)", abi >= 1, f"ABI {abi}" if abi >= 1 else "unavailable: sandbox runs best-effort (unconfined)")
+    sdk = (SERVER.parent.parent / "node_modules" / "@modelcontextprotocol" / "sdk").exists()
+    chk("MCP SDK installed", sdk, "ok" if sdk else f"run: cd {SERVER.parent.parent} && npm install")
+    chk("policy files", (CONF_DIR / "write-scopes.conf").exists(), str(CONF_DIR) if (CONF_DIR / "write-scopes.conf").exists() else "run: tarsus init")
+    sock = os.environ.get("FLEET_EXEC_SOCK", "/tmp/fleet-execd.sock")
+    chk("warm daemon (optional)", os.path.exists(sock), sock if os.path.exists(sock) else "not running — the MCP server starts it on first use")
+    width = max(len(c[0]) for c in checks)
+    for name, ok, detail in checks:
+        print(f"{'ok ' if ok else '-- '} {name:<{width}}  {detail}")
+    required = {"python >= 3.10", "node >= 22 (MCP server)", "bash", "rg", "patch", "MCP SDK installed"}
+    return 0 if all(ok for n, ok, _ in checks if n in required) else 1
+
+
+def client_entry() -> dict:
+    node, major = find_node()
+    if major < 22:
+        print(f"warning: no node >= 22 found (best: {node} v{major}); install Node 22+ and re-run", file=sys.stderr)
+    return {"command": node or "node", "args": [str(SERVER)],
+            "env": {"OMNITOOL_ROOT": str(ROOT),
+                    "OMNITOOL_SCOPES_FILE": str(CONF_DIR / "write-scopes.conf"),
+                    "TARSUS_CONF": str(CONF_DIR / "tarsus.conf"),
+                    "FLEET_EXEC_CLASSIFIER": "off"}}
+
+
+def client_path(client: str, project: Path) -> Path | None:
+    return {"claude-code": project / ".mcp.json",
+            "claude-desktop": Path("~/.config/Claude/claude_desktop_config.json").expanduser(),
+            "opencode": Path("~/.config/opencode/opencode.json").expanduser()}.get(client)
+
+
+def merge_into(path: Path, client: str, entry: dict) -> None:
+    data = {}
+    if path.exists():
+        data = json.loads(path.read_text() or "{}")
+        shutil.copy2(path, path.with_suffix(path.suffix + ".bak-tarsus"))
+    if client == "opencode":
+        data.setdefault("mcp", {})["tarsus"] = {"type": "local", "command": [entry["command"], *entry["args"]],
+                                                "environment": entry["env"], "enabled": True}
+    else:
+        data.setdefault("mcpServers", {})["tarsus"] = entry
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def init(projects, client, write) -> int:
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    scopes = CONF_DIR / "write-scopes.conf"
+    if not scopes.exists():
+        dirs = [str(Path(p).expanduser().resolve()) for p in (projects or [os.getcwd()])] + ["/tmp"]
+        scopes.write_text("# Tarsus write scopes — write/patch ops AND every bash op may write only beneath these.\n"
+                          + "\n".join(dirs) + "\n")
+        print(f"wrote {scopes}  ({', '.join(dirs)})")
+    else:
+        print(f"kept  {scopes}")
+    conf = CONF_DIR / "tarsus.conf"
+    if not conf.exists():
+        mode = "enforce" if landlock_abi() >= 1 else "best-effort"
+        conf.write_text("# Tarsus policy. sandbox = enforce | best-effort | off (read on every call)\n"
+                        f"sandbox = {mode}\nbash_extra_write = {DEFAULT_EXTRA}\n"
+                        "# guard policy (optional): rule.<id> = block|warn|off · custom.<id> = <block|warn> :: <bash|sql|any> ::"
+                        " <regex> :: <why> · approval_ttl_s = 900   — check with: tarsus policy show\n")
+        print(f"wrote {conf}  (sandbox = {mode})")
+    else:
+        print(f"kept  {conf}")
+    entry = client_entry()
+    target = client_path(client, Path(projects[0]).expanduser() if projects else Path.cwd())
+    if write and target:
+        merge_into(target, client, entry)
+        print(f"merged MCP server 'tarsus' into {target} (backup: *.bak-tarsus if it existed)")
+    else:
+        print(json.dumps({"mcpServers": {"tarsus": entry}}, indent=2))
+        if target:
+            print(f"(add it to {target}, or re-run with --write)")
+    return 0
+
+
+def _conf_value(key: str):
+    path = Path(os.environ.get("TARSUS_CONF") or (ROOT / "control-center" / "tarsus.conf")).expanduser()
+    try:
+        for line in path.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line and line.split("=", 1)[0].strip() == key:
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def audit(file, since, min_sev, task, stats, limit) -> int:
+    """TARSUS-0 C2 reader: the audit JSONL (OTel log data model) — newest last; --stats aggregates."""
+    import time as _t
+    from collections import Counter
+    path = file or os.environ.get("TARSUS_AUDIT") or _conf_value("audit")
+    if not path or path == "off":
+        print("audit is off: set `audit = <path>` in tarsus.conf (or TARSUS_AUDIT)", file=sys.stderr)
+        return 2
+    path = Path(path).expanduser()
+    if not path.exists():
+        print(f"no audit records yet at {path}")
+        return 0
+    cutoff = 0
+    if since:
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[since[-1]]
+        cutoff = (_t.time() - float(since[:-1]) * mult) * 1e9
+    order = {"INFO": 0, "WARN": 1, "ERROR": 2}
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        a = r.get("Attributes", {})
+        if r.get("Timestamp", 0) < cutoff or order.get(r.get("SeverityText"), 0) < order.get(min_sev, 0):
+            continue
+        if task and a.get("tarsus.actor.task") != task:
+            continue
+        rows.append(r)
+    if stats:
+        c = Counter(r["SeverityText"] for r in rows)
+        rules = Counter(x for r in rows for x in r["Attributes"].get("tarsus.guard.rules", []))
+        outc = Counter(r["Attributes"].get("tarsus.outcome") for r in rows)
+        denied = sum(1 for r in rows if r["Attributes"].get("tarsus.outcome.sandbox_denied"))
+        approved = sum(1 for r in rows if r["Attributes"].get("tarsus.guard.approved_by"))
+        print(f"{len(rows)} operations · severity {dict(c)} · outcome {dict(outc)} · sandbox denials {denied} · human approvals {approved}")
+        for rule, n in rules.most_common(10):
+            print(f"  rule {rule}: {n}")
+        return 0
+    for r in rows[-limit:]:
+        a = r["Attributes"]
+        when = _t.strftime("%m-%d %H:%M:%S", _t.localtime(r["Timestamp"] / 1e9))
+        who = a.get("tarsus.actor.task") or a.get("tarsus.actor.session") or a.get("enduser.id", "?")
+        what = a.get("tarsus.op.summary") or a.get("tarsus.op.fingerprint")
+        rules = ",".join(a.get("tarsus.guard.rules", [])) or "-"
+        print(f"{when} {r['SeverityText']:5s} {a.get('tarsus.op.type', '?'):5s} {a.get('tarsus.outcome', '?'):8s} {rules:16s} {who:14s} {str(what)[:70]}")
+    return 0
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="tarsus", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor")
+    pi = sub.add_parser("init")
+    pi.add_argument("--project", action="append", default=[], help="a directory agents may write in (repeatable)")
+    pi.add_argument("--client", default="print", choices=["print", "claude-code", "claude-desktop", "opencode"])
+    pi.add_argument("--write", action="store_true", help="merge the entry into the client's config file")
+    pd = sub.add_parser("audit")
+    pd.add_argument("--file")
+    pd.add_argument("--since", help="e.g. 30m, 2h, 1d")
+    pd.add_argument("--min-severity", default="INFO", choices=["INFO", "WARN", "ERROR"])
+    pd.add_argument("--task")
+    pd.add_argument("--stats", action="store_true")
+    pd.add_argument("--limit", type=int, default=50)
+    pp = sub.add_parser("policy")
+    pp.add_argument("args", nargs="+")
+    pa = sub.add_parser("approve")
+    pa.add_argument("fp", nargs="?")
+    a = ap.parse_args(argv)
+    if a.cmd == "doctor":
+        return doctor()
+    if a.cmd == "init":
+        return init(a.project, a.client, a.write)
+    if a.cmd == "audit":
+        return audit(a.file, a.since, a.min_severity, a.task, a.stats, a.limit)
+    if a.cmd == "policy":
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve().parent / "omnitool_guard.py"), "policy", *a.args])
+    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve().parent / "tarsus-approve"), *([a.fp] if a.fp else [])])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,3 +1,9 @@
+---
+title: Your data and your shards
+updated: 2026-09-29
+weaver_hash: b7dac8acd5aa2af3a33708b9b84babb2c023db1bb7f2db99f5624ef7e8bf1eb2
+weaver_imported: 2026-10-09T22:22:08+00:00
+---
 # Your data and your shards
 
 The software licence (`LICENSING.md`) covers **the engine's code only**.

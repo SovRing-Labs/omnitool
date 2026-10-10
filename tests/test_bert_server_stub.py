@@ -16,14 +16,14 @@ from conftest import bert_socket_request
 
 def test_health_check_works(bert_socket_available):
     if not bert_socket_available:
-        pytest.skip("SKIP interceptor: /tmp/omnitool_bert.sock not up (model + ONNX Runtime are not shipped; see README Build > interceptor)")
+        pytest.skip("experiment: omnitool_bert_server is off the production path (SYSTEMS.yaml intended off; FLEET_EXEC_BERT_SOCKET=1 to opt in)")
     resp = bert_socket_request({"health": True})
     assert resp.get("status") == "ok"
 
 
 def test_classify_honestly_errors_instead_of_fabricating(bert_socket_available):
     if not bert_socket_available:
-        pytest.skip("SKIP interceptor: /tmp/omnitool_bert.sock not up (model + ONNX Runtime are not shipped; see README Build > interceptor)")
+        pytest.skip("experiment: omnitool_bert_server is off the production path (SYSTEMS.yaml intended off; FLEET_EXEC_BERT_SOCKET=1 to opt in)")
     resp = bert_socket_request({"payload": {"operations": [
         {"type": "bash", "command": "rm -rf / --no-preserve-root"}
     ]}})

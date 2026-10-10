@@ -18,6 +18,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
+def _db_key(op: Dict[str, Any]) -> str:
+    """Dependency key for a sql-type op's database (path resolved, or db:<alias>); '' if none."""
+    if op.get("type") not in ("sql", "db_exec", "omni_sql"):
+        return ""
+    db = op.get("database") or "dispatch"
+    if not isinstance(db, str):
+        return ""
+    if "/" not in db and not db.endswith(".db"):
+        return "db:" + db
+    try:
+        return str(Path(db).expanduser().resolve())
+    except (ValueError, TypeError):
+        return ""
+
+
 def extract_file_refs(op: Dict[str, Any]) -> Set[str]:
     """Extract all file paths referenced by an operation."""
     refs = set()
@@ -36,13 +51,10 @@ def extract_file_refs(op: Dict[str, Any]) -> Set[str]:
         matches = re.findall(r'(/[a-zA-Z0-9._/-]+)', cmd)
         refs.update(Path(m).resolve() for m in matches if len(m) > 1)
     
-    # SQL: database path
-    db = op.get("database", "")
-    if isinstance(db, str) and not db.startswith(("dispatch", "lanes",)):
-        try:
-            refs.add(str(Path(db).expanduser().resolve()))
-        except (ValueError, TypeError):
-            pass
+    # SQL: database path (aliases like "dispatch" keyed as db:<alias> so same-alias ops still order)
+    db = _db_key(op)
+    if db:
+        refs.add(db)
     
     return refs
 
@@ -67,6 +79,12 @@ class DependencyGraph:
                 p = op.get("path") or op.get("target", "")
                 if p:
                     writes.add(str(Path(p).resolve()))
+            elif op.get("type") in ("sql", "db_exec", "omni_sql") and (op.get("mode") == "read_write" or op.get("type") == "db_exec"):
+                # a read_write sql op WRITES its database (was recorded as a read only: a later read in the same
+                # batch landed in the same parallel layer and saw pre-write state; found 2026-10-01 dogfooding omnid)
+                k = _db_key(op)
+                if k:
+                    writes.add(k)
             elif op.get("type") == "bash":
                 # Detect write-like commands (echo > file, tee, cp to dest)
                 cmd = op.get("command", "").lower()
@@ -101,7 +119,7 @@ class DependencyGraph:
         
         # Compute in-degree
         in_degree = defaultdict(int)
-        nodes = set(self.graph.keys()) | set(n for targets in self.graph.values() for n in targets)
+        nodes = set(range(len(self.ops)))   # every op (independent ops were appended as a LAST layer; now layer 0)
         for node in nodes:
             if node not in in_degree:
                 in_degree[node] = 0

@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""fleet-execd — resident fork server for bin/fleet-exec (IPC-1, 2026-10-01).
+
+Loads fleet-exec and its imports once; every request forks a child that takes the caller's cwd/env/argv/stdin and runs
+the unchanged fleet-exec main(), so behaviour (preflight, validation, guard, execution) is identical to the CLI while
+the per-call Python start-up and imports are paid once.
+
+  fleet-execd [--sock /tmp/fleet-execd.sock]          serve
+Request (one per connection): JSON {"argv": [...], "cwd": "...", "env": {...}, "stdin": "..."}
+Reply: JSON {"stdout": "...", "stderr": "...", "code": int}
+"""
+import argparse, contextlib, importlib.machinery, importlib.util, io, json, os, signal, socket, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+_ld = importlib.machinery.SourceFileLoader("fleet_exec", os.path.join(HERE, "fleet-exec"))
+FE = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_exec", _ld))
+_ld.exec_module(FE)
+for _m in ("omnitool_preflight", "omnitool_guard", "fleet_sql", "fleet_dependency_graph"):
+    with contextlib.suppress(Exception):
+        __import__(_m)
+
+
+def _warm():
+    """Run main() once in the parent so the lazy imports inside it are loaded before any fork (children inherit them)."""
+    op = json.dumps({"operations": [{"type": "read", "path": os.path.abspath(__file__)}]})
+    saved = sys.argv
+    sys.argv = ["fleet-exec", op]
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            FE.main()
+        except BaseException:
+            pass
+    sys.argv = saved
+
+
+def _child(conn, req):
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)               # the parent auto-reaps; workers must see exit codes
+    os.chdir(req.get("cwd") or os.getcwd())
+    os.environ.update({k: str(v) for k, v in (req.get("env") or {}).items()})
+    sys.argv = ["fleet-exec"] + list(req.get("argv") or [])
+    sys.stdin = io.StringIO(req.get("stdin") or "")
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            FE.main()
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        except Exception as e:                                   # report like the CLI would crash
+            err.write(f"{type(e).__name__}: {e}\n"); code = 1
+    conn.sendall(json.dumps({"stdout": out.getvalue(), "stderr": err.getvalue(), "code": code}).encode())
+    conn.close()
+
+
+def serve(path):
+    _warm()
+    if os.path.exists(path):
+        os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path); os.chmod(path, 0o600); srv.listen(64)
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)                # auto-reap children
+    while True:
+        conn, _ = srv.accept()
+        buf = b""
+        while (k := conn.recv(65536)):
+            buf += k
+            if buf.endswith(b"\n"):
+                break
+        try:
+            req = json.loads(buf)
+        except Exception as e:
+            conn.sendall(json.dumps({"stdout": "", "stderr": f"bad request: {e}", "code": 2}).encode()); conn.close(); continue
+        if os.fork() == 0:
+            srv.close()
+            try:
+                _child(conn, req)
+            finally:
+                os._exit(0)
+        conn.close()
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sock", default=os.environ.get("FLEET_EXEC_SOCK", "/tmp/fleet-execd.sock"))
+    serve(ap.parse_args().sock)

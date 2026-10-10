@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""tarsus-sbom — CycloneDX 1.5 software bill of materials for a Tarsus checkout (TARSUS-0 C5, 2026-10-06).
+
+    tarsus-sbom [--version V] [--root DIR] > tarsus-V.cdx.json
+
+Lists what ships: the Tarsus application itself (PolyForm dual licence), the MCP server's npm dependency tree from
+mcp/package-lock.json (exact versions, licences, purls, integrity hashes), the external programs it calls at run time
+(bash, GNU patch, git, ripgrep, python3, node — required, not bundled) and the optional advisory-classifier Python
+packages (scope "optional"). Standard library only, deterministic output for a given lockfile + version, so the CI
+release job and a local run produce the same document (except the timestamp / serial).
+"""
+import argparse
+import hashlib
+import json
+import sys
+import time
+import uuid
+from pathlib import Path
+
+PURPOSE_TOOLS = [  # (name, purpose) — run-time programs Tarsus invokes; not redistributed
+    ("bash", "shell for bash operations"), ("patch", "GNU patch, patch operations"), ("git", "patch fallback (git apply)"),
+    ("ripgrep", "glob / grep operations"), ("python3", "executor runtime (>= 3.10)"), ("node", "MCP server runtime (>= 22)"),
+]
+OPTIONAL_PY = ["sentence-transformers", "numpy", "fastapi", "uvicorn", "pydantic", "faiss-cpu"]
+
+
+def npm_components(lock_path: Path) -> list:
+    lock = json.loads(lock_path.read_text())
+    out = []
+    for key, meta in sorted(lock.get("packages", {}).items()):
+        if not key.startswith("node_modules/"):
+            continue
+        name = key.split("node_modules/")[-1]
+        version = meta.get("version", "")
+        comp = {"type": "library", "bom-ref": f"pkg:npm/{name}@{version}", "name": name, "version": version,
+                "purl": f"pkg:npm/{name.replace('@', '%40', 1) if name.startswith('@') else name}@{version}",
+                "scope": "optional" if meta.get("optional") or meta.get("dev") else "required"}
+        if meta.get("license"):
+            comp["licenses"] = [{"expression": meta["license"]}]
+        integrity = meta.get("integrity", "")
+        if integrity.startswith("sha512-"):
+            import base64
+            comp["hashes"] = [{"alg": "SHA-512", "content": base64.b64decode(integrity[7:]).hex()}]
+        out.append(comp)
+    return out
+
+
+def main(argv) -> int:
+    ap = argparse.ArgumentParser(prog="tarsus-sbom")
+    ap.add_argument("--version", default="0.2.0")
+    ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
+    ap.add_argument("--lock", help="package-lock.json (default <root>/mcp/package-lock.json)")
+    a = ap.parse_args(argv)
+    root = Path(a.root)
+    lock = Path(a.lock) if a.lock else root / "mcp" / "package-lock.json"
+    if not lock.exists():
+        print(f"tarsus-sbom: no lockfile at {lock}", file=sys.stderr)
+        return 2
+    comps = npm_components(lock)
+    comps += [{"type": "application", "bom-ref": f"tool:{n}", "name": n, "scope": "required",
+               "description": f"external program, not bundled: {why}"} for n, why in PURPOSE_TOOLS]
+    comps += [{"type": "library", "bom-ref": f"pkg:pypi/{n}", "name": n, "purl": f"pkg:pypi/{n}", "scope": "optional",
+               "description": "optional advisory intent classifier (not installed by default)"} for n in OPTIONAL_PY]
+    lock_hash = hashlib.sha256(lock.read_bytes()).hexdigest()
+    bom = {
+        "bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1,
+        "serialNumber": f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, f'tarsus/{a.version}/{lock_hash}')}",
+        "metadata": {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "tools": {"components": [{"type": "application", "name": "tarsus-sbom", "version": a.version}]},
+            "component": {"type": "application", "bom-ref": f"pkg:github/SovRing-Labs/tarsus@v{a.version}",
+                          "name": "tarsus", "version": a.version,
+                          "purl": f"pkg:github/SovRing-Labs/tarsus@v{a.version}",
+                          "licenses": [{"expression": "PolyForm-Small-Business-1.0.0 OR PolyForm-Noncommercial-1.0.0"}],
+                          "description": "safe hands for tool-calling agents (formerly omnitool)"},
+            "properties": [{"name": "tarsus:mcp-lockfile-sha256", "value": lock_hash}],
+        },
+        "components": comps,
+        "dependencies": [{"ref": f"pkg:github/SovRing-Labs/tarsus@v{a.version}",
+                          "dependsOn": [c["bom-ref"] for c in comps if c.get("scope") == "required"]}],
+    }
+    json.dump(bom, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

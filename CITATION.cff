@@ -1,12 +1,13 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "omnitool: a JSON batch executor for tool-calling agents"
-version: 0.1.0
-abstract: "Executes JSON batches of shell, file, patch and SQL operations for LLM agents, with payload repair, a guard layer, a parse-error doctor and a circuit breaker. Published as prior art."
+title: "Tarsus: safe hands for tool-calling agents (formerly omnitool)"
+version: 0.2.0
+abstract: "Executes JSON batches of shell, file, patch and SQL operations for LLM agents with payload repair, a guard layer, a Landlock-sandboxed bash, human-only approvals, an audit log, a parse-error doctor and a circuit breaker. Published as prior art."
 authors:
   - family-names: "De Santiago"
     given-names: "Juan Carlos"
 license:
   - PolyForm-Small-Business-1.0.0
   - PolyForm-Noncommercial-1.0.0
-keywords: [LLM agents, tool calling, batch execution, MCP]
+repository-code: "https://github.com/SovRing-Labs/tarsus"
+keywords: [LLM agents, tool calling, batch execution, MCP, sandbox]

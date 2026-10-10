@@ -16,9 +16,12 @@ do not repeat that.
 import json
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
-FLEET_EXEC = Path(__file__).resolve().parent.parent / "bin" / "fleet-exec"
+# tool root = first parent holding bin/fleet-exec (ai-stack in the dev tree, the checkout in a release export)
+FLEET_EXEC = next(p for p in Path(__file__).resolve().parents if (p / "bin" / "fleet-exec").exists()) / "bin" / "fleet-exec"
 
 
 def run_fleet_exec(payload, timeout=15):
@@ -76,18 +79,28 @@ def test_shell_comment_is_not_treated_as_a_command():
     assert result["ok"] is True and result["results"][0]["exit_code"] == 0
 
 
-def test_allow_destructive_lets_an_approved_op_run(tmp_path):
+def test_only_a_human_minted_approval_lets_a_blocked_op_run(tmp_path, monkeypatch):
+    """A4 (J 2026-10-06): allow_destructive alone no longer approves; a one-shot token for the op's fingerprint does."""
+    approvals = tmp_path / "approvals"
+    monkeypatch.setenv("TARSUS_APPROVAL_DIR", str(approvals))
+    sys.path.insert(0, str((FLEET_EXEC.parent / "omnitool_guard.py").resolve().parent))
+    import omnitool_guard as g
+    monkeypatch.setattr(g, "APPROVAL_DIR", str(approvals))
     repo = tmp_path / "r"
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / "f").write_text("x")
     subprocess.run(["git", "-C", str(repo), "add", "f"], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"], check=True)
     (repo / "f").write_text("changed")
-    cmd = f"git -C {repo} reset --hard HEAD"
-    blocked, _ = run_fleet_exec({"operations": [{"type": "bash", "command": cmd}]})
-    assert blocked["ok"] is False and (repo / "f").read_text() == "changed"
-    ok, _ = run_fleet_exec({"operations": [{"type": "bash", "command": cmd, "allow_destructive": True}]})
+    op = {"type": "bash", "command": f"git -C {repo} reset --hard HEAD", "allow_destructive": True}
+    blocked, _ = run_fleet_exec({"operations": [op]})
+    assert blocked["ok"] is False and "approval fingerprint" in blocked["errs"][0]
+    assert (repo / "f").read_text() == "changed"
+    g.mint_approval(g.op_fingerprint(op), by="test")
+    ok, _ = run_fleet_exec({"operations": [op]})
     assert ok["ok"] is True and (repo / "f").read_text() == "x"
+    again, _ = run_fleet_exec({"operations": [op]})          # one-shot
+    assert again["ok"] is False
 
 
 def test_sql_drop_is_blocked():
@@ -155,5 +168,22 @@ def test_bash_quotes_preserved():
     assert result["ok"] is True
     assert "it's working" in result["results"][0].get("stdout", "")
 
-# (release 0.1.0) test_acts_leave_field_marks is not shipped: the stigmergy field store it
-# checks (weaver/marks.py) is not part of this release; fleet-exec skips marks when it is absent.
+
+@pytest.mark.skipif(not (FLEET_EXEC.parent.parent / "weaver" / "marks.py").exists(),
+                    reason="stigmergy marks hook is fleet-only (weaver/marks.py not present in a release export)")
+def test_acts_leave_field_marks(tmp_path, monkeypatch):
+    """STIGMERGY-LOOP 2026-09-27: write/read/bash/guard-block each leave a mark in the (temp) field."""
+    import sqlite3
+    monkeypatch.setenv("TALON_TASK_ID", "T-FIELD-TEST")
+    monkeypatch.setenv("TALON_SESSION", "tln_test")
+    f = tmp_path / "m.txt"
+    run_fleet_exec({"operations": [{"type": "write", "path": str(f), "content": "x"},
+                                   {"type": "read", "path": str(f)},
+                                   {"type": "bash", "command": "true"}]})
+    run_fleet_exec({"operations": [{"type": "bash", "command": "sudo true"}]})
+    import os
+    rows = sqlite3.connect(os.environ["FIELD_DB"]).execute(
+        "SELECT kind, outcome, session FROM marks WHERE task='T-FIELD-TEST' ORDER BY id").fetchall()
+    kinds = [r[0] for r in rows]
+    assert kinds[:3] == ["file", "read", "command"] and "violation" in kinds
+    assert all(r[2] == "tln_test" for r in rows)

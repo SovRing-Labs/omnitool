@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ┌─ CORE FILE · governed by control-center/core-changelog.jsonl ──────────
+# │ ⚠  LOAD-BEARING. 1 logged change(s). Read the ledger before editing:
+# │     bin/core-changelog show bin/fleet_patch.py
+# │ Last: 2026-10-06T06:51Z · claude-seat · 8d8c85764 · KERNEL-DOGFOOD-1 (bugs #130 #125 #123 #128 #121 #124 #105): plan ...
+# └─────────────────────────────────────────────
 """
 fleet-patch — High-Efficiency Unified Diff Applier for Markdown & Code Files
 
@@ -104,15 +109,34 @@ def apply_patch(diff_text: str, target: str | None = None, dry_run: bool = False
         # doesn't. Try it only after both -p0/-p1 `patch` attempts fail --
         # doesn't change behavior for the common case, adds a real fallback for
         # a diff that's drifted slightly from the target's current content.
+        # KERNEL-DOGFOOD-1 (bugs #121, #124): git apply ran in the target's dir but resolved the diff's OWN header
+        # path from there (target ui/src/routes/X + header b/ui/src/routes/X -> ui/src/routes/b/ui/src/routes/X), and
+        # rejected hand-written hunks whose @@ line counts were off. With a single-file target, re-head the diff to
+        # the target's basename (-p1) and let --recount derive the counts from the hunk bodies.
+        git_patch_path, git_levels = temp_patch_path, ["-p1", "-p0"]
+        if resolved_target and len(candidate_paths) <= 1:
+            name = resolved_target.name
+            reheaded = re.sub(r"(?m)^--- (?!/dev/null).*$", lambda _m: f"--- a/{name}", diff_text)
+            reheaded = re.sub(r"(?m)^\+\+\+ (?!/dev/null).*$", lambda _m: f"+++ b/{name}", reheaded)
+            if not reheaded.lstrip().startswith("---"):
+                reheaded = f"--- a/{name}\n+++ b/{name}\n" + reheaded
+            if not reheaded.endswith("\n"):
+                reheaded += "\n"
+            with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as tf2:
+                tf2.write(reheaded)
+                git_patch_path, git_levels = tf2.name, ["-p1"]
         if not applied and resolved_target:
             git_cwd = str(resolved_target.parent)
-            for p_level in ["-p1", "-p0"]:
-                cmd = ["git", "apply", "--whitespace=fix", "--check", p_level, temp_patch_path]
-                res = subprocess.run(cmd, capture_output=True, text=True, cwd=git_cwd)
+            # Inside a repo subdir git apply resolves paths from the repo TOP; stop discovery above git_cwd so paths
+            # resolve from git_cwd, like patch(1).
+            git_env = {**os.environ, "GIT_CEILING_DIRECTORIES": git_cwd}
+            for p_level in git_levels:
+                cmd = ["git", "apply", "--recount", "--whitespace=fix", "--check", p_level, git_patch_path]
+                res = subprocess.run(cmd, capture_output=True, text=True, cwd=git_cwd, env=git_env)
                 if res.returncode == 0:
                     if not dry_run:
-                        real_cmd = ["git", "apply", "--whitespace=fix", p_level, temp_patch_path]
-                        real_res = subprocess.run(real_cmd, capture_output=True, text=True, cwd=git_cwd)
+                        real_cmd = ["git", "apply", "--recount", "--whitespace=fix", p_level, git_patch_path]
+                        real_res = subprocess.run(real_cmd, capture_output=True, text=True, cwd=git_cwd, env=git_env)
                         if real_res.returncode == 0:
                             applied = True
                             break
@@ -140,8 +164,9 @@ def apply_patch(diff_text: str, target: str | None = None, dry_run: bool = False
         }
 
     finally:
-        if os.path.exists(temp_patch_path):
-            os.unlink(temp_patch_path)
+        for tp in {temp_patch_path, locals().get("git_patch_path") or temp_patch_path}:
+            if os.path.exists(tp):
+                os.unlink(tp)
 
 
 def main():

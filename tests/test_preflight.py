@@ -56,9 +56,6 @@ def test_well_formed_payload_passes_through_unchanged():
     raw = {"operations": [{"type": "bash", "command": "echo hi"}], "concurrency": "parallel"}
     ops = _ops(raw)
     assert ops == raw["operations"]
-    raw = {"operations": [{"type": "bash", "command": "echo hi"}], "concurrency": "parallel"}
-    ops = _ops(raw)
-    assert ops == raw["operations"]
 
 
 def test_stringified_operations_array_is_parsed_not_split():
