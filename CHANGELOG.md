@@ -1,12 +1,6 @@
 # tarsus changelog
 
 ## 0.2.0 (2026-10-10)
----
-title: NOTES
-updated: 2026-10-06
-weaver_hash: e9e0ee25862939aa900a131d5f5d39a425a6e6b2f39d984f4829231772d096b8
-weaver_imported: 2026-10-09T22:22:08+00:00
----
 ## Tarsus 0.2.0 (formerly omnitool) — 2026-10-06
 
 **Renamed.** "omnitool" collided with Microsoft OmniTool and omnitool-ai; the project is now **Tarsus** (the raptor's

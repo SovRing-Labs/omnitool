@@ -1,9 +1,3 @@
----
-title: Shard format 1.0 (omni-ring / vsa-core slots)
-updated: 2026-09-29
-weaver_hash: 02ae1acb0cffaf0ef1740793d7d1bba1958b2fbb152ff06877182d90d0aed89d
-weaver_imported: 2026-10-09T22:22:08+00:00
----
 # Shard format 1.0 (omni-ring / vsa-core slots)
 
 **Licence of this specification:** Creative Commons Attribution 4.0 International (CC BY 4.0). Anyone may implement it.

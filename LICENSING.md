@@ -1,9 +1,3 @@
----
-title: Licensing — choose either licence
-updated: 2026-09-29
-weaver_hash: cfc9cb24051e878b2cf7bb8dea9c34d7afe6e58dcac58ca45a02c46317cff4a7
-weaver_imported: 2026-10-09T22:22:08+00:00
----
 # Licensing — choose either licence
 
 This software is offered under **two** licences. You may use it under **whichever one fits you**:

@@ -1,9 +1,3 @@
----
-title: TARSUS — Technical Disclosure, Part 2 (2026-10-06)
-updated: 2026-10-06
-weaver_hash: fe6d31dcf5cd7a9afeee7ff7061d5e38aff267f999c71e4220f6d24d9859acef
-weaver_imported: 2026-10-09T22:22:08+00:00
----
 # TARSUS — Technical Disclosure, Part 2 (2026-10-06)
 
 **Title:** Kernel-confined command execution for language-model agents with operator-only, one-shot, operation-bound

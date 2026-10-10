@@ -1,9 +1,3 @@
----
-title: Tarsus 0.2.0 — safe hands for tool-calling agents
-updated: 2026-10-06
-weaver_hash: d6e824d0bf7609e1d9864b5647aca395f84cf4456099f12d200fb002f815a8af
-weaver_imported: 2026-10-09T22:22:08+00:00
----
 # Tarsus 0.2.0 — safe hands for tool-calling agents
 
 Tarsus (formerly *omnitool*) is the "hands" of an agent: one call carries a JSON batch of operations (`bash`, `read`,
