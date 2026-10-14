@@ -2,6 +2,7 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "Tarsus: safe hands for tool-calling agents (formerly omnitool)"
 version: 0.2.0
+doi: "10.5281/zenodo.23282013"
 abstract: "Executes JSON batches of shell, file, patch and SQL operations for LLM agents with payload repair, a guard layer, a Landlock-sandboxed bash, human-only approvals, an audit log, a parse-error doctor and a circuit breaker. Published as prior art."
 authors:
   - family-names: "De Santiago"
