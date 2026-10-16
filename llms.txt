@@ -1,0 +1,20 @@
+# tarsus
+
+> Tarsus (formerly *omnitool*) is the "hands" of an agent: one call carries a JSON batch of operations (`bash`, `read`, `write`, `patch`, `sql`, `glob`, `grep`, `fix_json`), which is repaired, validated, safety-checked and executed in parallel, sequentially or in dependency order, and answered with on
+
+Setup: `git clone --depth 1 https://github.com/SovRing-Labs/tarsus && cd tarsus && python3 bin/omnitool_guard.py selftest` (expect: OMNITOOL-GUARD SELFTEST: PASS (62/62)).
+Licence: PolyForm Small Business 1.0.0 OR PolyForm Noncommercial 1.0.0 (free trial for evaluation).
+
+## Docs
+- [README.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/README.md)
+- [DOSSIER.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/DOSSIER.md)
+- [TECHNICAL-DISCLOSURE.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/TECHNICAL-DISCLOSURE.md)
+- [PROVENANCE.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/PROVENANCE.md)
+- [LICENSING.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/LICENSING.md)
+- [CITATION.cff](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/CITATION.cff)
+- [AGENTS.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/AGENTS.md)
+- [STATUS.md](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/STATUS.md)
+- [suite.json](https://raw.githubusercontent.com/SovRing-Labs/tarsus/main/suite.json)
+
+## Optional
+- [SovRing umbrella (all repos, MCP setup)](https://github.com/SovRing-Labs/SovRing)
