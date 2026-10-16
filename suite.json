@@ -1,0 +1,269 @@
+{
+  "_about": {
+    "repo": "tarsus",
+    "url": "https://github.com/SovRing-Labs/tarsus",
+    "one_line": "Safe hands for tool-calling agents: batch tool execution with payload repair, a deterministic safety guard, kernel (Landlock) write confinement, human-only approval, audit trail and an MCP server. Linux only.",
+    "quicktest": "python3 bin/omnitool_guard.py selftest",
+    "quicktest_s": 3,
+    "licence": "PolyForm Small Business 1.0.0 OR PolyForm Noncommercial 1.0.0, your choice (LICENSING.md)",
+    "status_file": "STATUS.md",
+    "generated": "2026-10-16",
+    "schema": 1,
+    "source": "README.md, DOSSIER.md, TECHNICAL-DISCLOSURE.md, TECHNICAL-DISCLOSURE-PART2.md, release-scan.txt, Makefile, tests/, mcp/test/"
+  },
+  "tests": [
+    {
+      "id": "T1",
+      "title": "Guard self-test: 62/62 named must-block / must-pass cases",
+      "claim": "Guard selftest 62/62 (incl. flag-alone refused, token runs once, token not reusable, self-approval blocked)",
+      "kind": "run",
+      "verify": "python3 bin/omnitool_guard.py selftest",
+      "expect": "OMNITOOL-GUARD SELFTEST: PASS (62/62)",
+      "evidence": [
+        "TECHNICAL-DISCLOSURE-PART2.md",
+        "bin/omnitool_guard.py"
+      ],
+      "runtime_s": 3,
+      "needs": [
+        "python3 >= 3.10"
+      ],
+      "what_it_means": "The safety guard carries its own list of commands that must be blocked and commands that must pass, plus the human-approval rules (an approval token works once, cannot be self-issued, a flag alone does not unlock a blocked op). Passing proves every listed case still gets the right verdict in the version you cloned. It does not prove the list is complete: a destructive command nobody wrote down is not covered, and the guard is a set of pattern rules, not a sandbox (the sandbox is T3).",
+      "how_we_got_it": "`python3 bin/omnitool_guard.py selftest` from the repo root. TECHNICAL-DISCLOSURE-PART2.md section 5 (2026-10-06) records 62/62; the earlier disclosure (2026-09-29) records 59/59 for the smaller list. Re-run on 2026-10-16 in a clean copy: PASS (62/62). Machine for the original runs: Intel i5-8365U (DOSSIER.md); this re-run machine is not recorded in the repo.",
+      "use_in_your_work": "Put an agent's shell and SQL access behind a deterministic rule list that you can read and extend: add a command to must_block, run the self-test, and the rule is pinned. Useful for any local model that is allowed to run commands.",
+      "honest_limits": "Pattern rules; false negatives are possible and the project says a false positive is fixed by narrowing the rule. Docs of different dates quote different counts (59, then 62); 62 is current.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T2",
+      "title": "Guard verdicts: five destructive commands BLOCK, ls and pytest pass",
+      "claim": "Guard verdicts: mkfs.ext4 /dev/sda1, fork bomb, git push --force origin main, rm -rf /, SQL DROP TABLE all BLOCK (rules mkfs, fork-bomb, git-force-push, rm-protected, sql-drop); ls -la, pytest -> ok; guard cost 48 µs per op check",
+      "kind": "run",
+      "verify": "python3 -c \"import sys;sys.path.insert(0,'bin');import omnitool_guard as g;ops=[({'type':'bash','command':'mkfs.ext4 /dev/sda1'},'mkfs'),({'type':'bash','command':':(){ :|:& };:'},'fork-bomb'),({'type':'bash','command':'git push --force origin main'},'git-force-push'),({'type':'bash','command':'rm -rf /'},'rm-protected'),({'type':'sql','query':'DROP TABLE users'},'sql-drop')];[print(r['level'],r['rules'][0]['id']) for r in (g.check_operation(o) for o,_ in ops)];assert all(g.check_operation(o)['level']=='block' and g.check_operation(o)['rules'][0]['id']==i for o,i in ops);assert all(g.check_operation({'type':'bash','command':c})['level']=='ok' for c in ('ls -la','pytest'));print('ls -la, pytest: ok')\"",
+      "expect": "block mkfs; block fork-bomb; block git-force-push; block rm-protected; block sql-drop; ls -la, pytest: ok",
+      "evidence": [
+        "TECHNICAL-DISCLOSURE.md",
+        "bin/omnitool_guard.py"
+      ],
+      "runtime_s": 2,
+      "needs": [
+        "python3 >= 3.10"
+      ],
+      "what_it_means": "The same five dangerous operations named in the disclosure are fed to the guard and each comes back BLOCK under the named rule, while two routine commands come back ok. Passing proves the verdict and the rule id for those seven inputs. It does not prove the 48 microsecond cost (a timing, not re-measured here) and it covers a handful of examples, not the rule set.",
+      "how_we_got_it": "TECHNICAL-DISCLOSURE.md section 10 (2026-09-29, Intel i5-8365U per DOSSIER.md): 'Guard verdicts ... all BLOCK (rules mkfs, fork-bomb, git-force-push, rm-protected, sql-drop)' and 'Guard cost 48 µs per op check (10,000 checks, Python, one core)'. This test calls bin/omnitool_guard.py check_operation directly on those inputs.",
+      "use_in_your_work": "A quick way to see exactly which rule fires on a command before you let an agent run it; check_operation can be called from your own wrapper.",
+      "honest_limits": "The timing figure is quoted from the disclosure, not re-timed by this test.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T3",
+      "title": "Kernel write confinement (Landlock): writes outside the scope are denied",
+      "claim": "bash ops run under Landlock: writes only beneath the write scopes; sandbox tests 7 (outside write denied, full in-scope lifecycle, children inherit, detached path confined, extra grants, off mode, enforce refuses without Landlock)",
+      "kind": "run",
+      "verify": "cd tests && python3 -m pytest -q -p no:cacheprovider test_sandbox.py 2>&1 | tail -1 | grep -E '^[0-9]+ passed' | grep -v failed",
+      "expect": "6 passed, 1 skipped (the skipped one only runs outside a sandbox)",
+      "evidence": [
+        "TECHNICAL-DISCLOSURE-PART2.md",
+        "tests/test_sandbox.py",
+        "bin/tarsus_sandbox.py"
+      ],
+      "runtime_s": 12,
+      "needs": [
+        "python3",
+        "pytest",
+        "Linux with Landlock (kernel 5.13+)"
+      ],
+      "what_it_means": "Each shell command is started by a small launcher that asks the Linux kernel to forbid any write outside the allowed directories, and the tests try it: a write outside the scope is refused by the kernel, a write inside works end to end, child processes inherit the restriction, the detached path is confined too, and with enforcement on the launcher refuses to run if Landlock is missing. Passing proves the confinement holds on your kernel. It does not confine reads, network or CPU, and one test (off mode) skips when the test process is itself sandboxed.",
+      "how_we_got_it": "tests/test_sandbox.py on Linux 7.0, Landlock ABI 8 (TECHNICAL-DISCLOSURE-PART2.md); launcher overhead about 10 ms per operation (2026-10-06). Re-run on 2026-10-16 in a clean copy: 6 passed, 1 skipped.",
+      "use_in_your_work": "Confine an agent's shell to a project directory at the kernel level, so a wrong command or a hostile prompt cannot write elsewhere, without containers.",
+      "honest_limits": "Linux only. Network confinement is listed as a disclosed variation, not built. If Landlock is unavailable the test fails or the launcher refuses, by design.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T4",
+      "title": "Preflight repair of malformed agent payloads (unit tests)",
+      "claim": "Preflight repair of malformed shapes 8 / 10 (see limitations); the repair tests wrap naked objects and normalise hallucinated shapes into {\"operations\": [...]}",
+      "kind": "run",
+      "verify": "cd tests && python3 -m pytest -q -p no:cacheprovider test_preflight.py test_doctor_quotes.py test_dogfood_fixes.py 2>&1 | tail -1 | grep -E '^[0-9]+ passed' | grep -v failed",
+      "expect": "27 passed (14 preflight + 3 quote repair + 10 dogfood fixes)",
+      "evidence": [
+        "TECHNICAL-DISCLOSURE.md",
+        "tests/test_preflight.py",
+        "tests/test_doctor_quotes.py"
+      ],
+      "runtime_s": 10,
+      "needs": [
+        "python3",
+        "pytest"
+      ],
+      "what_it_means": "Small local models often emit tool calls in wrong shapes (a bare object, a string, nested keys). These tests feed the known bad shapes to the repair step and assert a well-formed operations list comes out, and that a command with a missing closing quote is repaired once. Passing proves those listed shapes are handled. It does not mean every malformed payload is repaired: the disclosure itself reports 8 of 10 shapes and lists the two it gets wrong (T10).",
+      "how_we_got_it": "tests/test_preflight.py, test_doctor_quotes.py and test_dogfood_fixes.py under pytest; the 8 / 10 figure is from TECHNICAL-DISCLOSURE.md section 10 (2026-09-29, i5-8365U). Counts re-run 2026-10-16: 27 passed.",
+      "use_in_your_work": "Harden any tool-calling loop for small models: normalise the payload before validating it, rather than failing the call and burning a turn.",
+      "honest_limits": "Repair can change meaning (T10). The 8 / 10 harness is not a committed script; only the unit tests are.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T5",
+      "title": "Human approval, policy and audit trail tests",
+      "claim": "only a human can approve a blocked operation; policy cannot relax self-approval; every op writes one audit record that never stores command text in hash mode",
+      "kind": "run",
+      "verify": "cd tests && python3 -m pytest -q -p no:cacheprovider test_policy.py test_audit.py test_fleet_exec_integration.py 2>&1 | tail -1 | grep -E '^[0-9]+ passed' | grep -v failed",
+      "expect": "25 passed, 1 skipped (7 policy + 5 audit + 13 integration; 1 skip needs the author's fleet-only marks hook)",
+      "evidence": [
+        "README.md",
+        "tests/test_policy.py",
+        "tests/test_audit.py",
+        "tests/test_fleet_exec_integration.py"
+      ],
+      "runtime_s": 40,
+      "needs": [
+        "python3",
+        "pytest"
+      ],
+      "what_it_means": "End-to-end tests through the executor: a blocked batch needs an approval token written through the human channel, policy overrides raise or drop rules but can never turn on self-approval, policy errors are reported rather than ignored, and each operation yields one audit record in OpenTelemetry shape, with hash mode never recording command text. Passing proves these behaviours in the clone. It does not prove the approval channel is safe against a user who can edit the approval directory themselves (an operator with filesystem access is trusted).",
+      "how_we_got_it": "pytest on the three files from the repo root's tests/ folder; description from README.md and TECHNICAL-DISCLOSURE-PART2.md. Re-run 2026-10-16 in a clean copy: 5 + 7 + 13 passed, 1 skipped; machine not recorded in the repo.",
+      "use_in_your_work": "A pattern for letting an agent propose a risky action while only a person can release it, with a per-run audit log you can aggregate.",
+      "honest_limits": "Approval tokens are filesystem-based; signed tokens and remote approval are listed variations, not built.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T6",
+      "title": "Whole Python suite (except the model-dependent classifier tests)",
+      "claim": "make test: pytest suite passes; classifier tests SKIP without sentence-transformers, interceptor tests SKIP without its socket",
+      "kind": "run",
+      "verify": "cd tests && l=$(python3 -m pytest -q -p no:cacheprovider --ignore=test_classifier.py 2>&1 | tail -1); echo \"$l\"; echo \"$l\" | grep -E '^[0-9]+ passed' | grep -vq failed",
+      "expect": "69 passed, 4 skipped (no failures)",
+      "evidence": [
+        "Makefile",
+        "release-scan.txt"
+      ],
+      "runtime_s": 90,
+      "needs": [
+        "python3",
+        "pytest"
+      ],
+      "what_it_means": "Every Python test in tests/ except the sentence-embedding classifier tests: guard, sandbox, preflight, approvals, audit, SBOM, init/doctor CLI, circuit breaker. Passing proves no regression in those areas on your machine. Skips are listed and have reasons (BERT stub is off the production path, fleet-only marks hook, sandboxed test process).",
+      "how_we_got_it": "The Makefile test-py target, run as `cd tests && python3 -m pytest -q -rs -p no:cacheprovider`. release-scan.txt records 30 passed, 2 skipped on 2026-09-29 (older, smaller suite); on 2026-10-16 the full run was 76 passed, 4 skipped in 222 s with sentence-transformers installed, and the same suite without the classifier file is 69 passed, 4 skipped.",
+      "use_in_your_work": "Regression check before you change the guard rules or sandbox defaults in a fork.",
+      "honest_limits": "Counts in the docs (30, 40) are older than the suite; the count grows as tests are added. Classifier tests are excluded here (T8).",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T7",
+      "title": "MCP output truncation tests (node:test, no install)",
+      "claim": "node:test truncate 5/5: short text passes through, elided output spills in full to a private pageable file, file reads bypass truncation, a single huge line is shrunk not duplicated",
+      "kind": "run",
+      "verify": "cd mcp && MCP_TEST_MODE=1 node --test test/truncate.test.js 2>&1 | grep -E '^# (tests|pass|fail)'",
+      "expect": "# tests 5, # pass 5, # fail 0",
+      "evidence": [
+        "release-scan.txt",
+        "mcp/test/truncate.test.js"
+      ],
+      "runtime_s": 3,
+      "needs": [
+        "node >= 18"
+      ],
+      "what_it_means": "Five tests of the output condenser: when a tool result is too long for a model's context, the head and tail are kept, a clear marker says what was cut, and the full text is saved to a file the model can page. Passing proves the cutter's rules. It does not measure how much context it saves on your workload.",
+      "how_we_got_it": "mcp/test/truncate.test.js; release-scan.txt records 'node:test truncate 5/5' on 2026-09-29. Re-run 2026-10-16 on Node 18: 5 pass.",
+      "use_in_your_work": "Keep a local model from drowning in a giant tool result while keeping the full output retrievable.",
+      "honest_limits": "Unit-level only; the Makefile says Node 22+, but this file runs on Node 18.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T8",
+      "title": "MCP server tool tests (needs npm install of the MCP SDK)",
+      "claim": "MCP tool tests 11/11 with the SDK installed: release server lists exactly the core tools, edit round-trip, guard-blocked op names its approval fingerprint, annotations, autostart",
+      "kind": "external",
+      "verify": "cd mcp && npm install --no-audit --no-fund >/dev/null 2>&1 && MCP_TEST_MODE=1 node --test test/tarsus-server.test.js 2>&1 | grep -E '^# (tests|pass|fail)'",
+      "expect": "# tests 8 and # fail 0 in this version (README/disclosure quote 11/11 for the 2026-09-29 count)",
+      "evidence": [
+        "release-scan.txt",
+        "mcp/test/tarsus-server.test.js",
+        "mcp/package-lock.json"
+      ],
+      "runtime_s": 60,
+      "needs": [
+        "node >= 22",
+        "npm and network access to install @modelcontextprotocol/sdk"
+      ],
+      "what_it_means": "Checks the MCP server file lists exactly ten tools, contains no author-fleet paths, round-trips an edit exactly, and names an approval fingerprint when the guard blocks. Passing proves the shipped server wiring. It cannot run offline because it needs the SDK from npm.",
+      "how_we_got_it": "mcp/test/tarsus-server.test.js; release-scan.txt records 11/11 with the SDK installed (2026-09-29); not re-run here because it needs network (marked external).",
+      "use_in_your_work": "Sanity check after you install the MCP server into your client.",
+      "honest_limits": "External: network install. Counts differ between docs and the current file (8 test blocks); not reconciled.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T9",
+      "title": "Honest negative: the embedding classifier does not separate destructive from safe",
+      "claim": "mkfs 0.155 / 0.136 -> labelled safe; fork bomb 0.205 / 0.131 -> safe; git push --force 0.139 / 0.028 -> safe; rm -rf / 0.190 / 0.373 -> destructive; so the guard is deterministic and the classifier advisory only",
+      "kind": "file",
+      "verify": "python3 -c \"t=open('TECHNICAL-DISCLOSURE.md',encoding='utf-8').read();S=['mkfs\\x60 0.155 / 0.136', 'fork bomb 0.205 / 0.131', '\\x60git push --force\\x60 0.139 / 0.028', '\\x60rm -rf /\\x60 0.190 / 0.373', 'advisory only'];m=[x for x in S if x not in t];[print('found',x) for x in S if x in t];assert not m,m\"",
+      "expect": "found each of the five strings (all present)",
+      "evidence": [
+        "TECHNICAL-DISCLOSURE.md",
+        "DOSSIER.md"
+      ],
+      "runtime_s": 1,
+      "needs": [
+        "python3"
+      ],
+      "what_it_means": "A small sentence-embedding model was tried as the safety judge and measured: two of the most dangerous commands (mkfs, a fork bomb) and a force-push scored higher on 'safe' than on 'destructive'. That is why blocking decisions use named rules and the learned label is advisory only. Passing here proves the disclosure records those scores. DOSSIER summarises it as mislabelling 3 of 4 destructive commands safe. It does not show that no embedding model could do better.",
+      "how_we_got_it": "Measured 2026-09-29 on an Intel i5-8365U (DOSSIER.md) with a small sentence-embedding model (all-MiniLM-L6-v2 believed; excluded from the release); results table in TECHNICAL-DISCLOSURE.md sections 6 and 10. The classifier tests (tests/test_classifier.py) need sentence-transformers and take about two minutes, so they are not part of this file check.",
+      "use_in_your_work": "Before trusting a learned classifier as a safety gate, run it on a handful of known-destructive commands and read the scores; if it cannot separate them, keep the gate rule-based.",
+      "honest_limits": "One embedding model, a few commands. A negative about this classifier, not about learned judges in general. Re-measuring needs the model download.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T10",
+      "title": "Honest negative: preflight limits and a repair that changed meaning",
+      "claim": "Preflight repaired 8 / 10 shapes; an operations value that is a JSON string of an array is split into one-character bash ops; echo it's fine was repaired by appending a quote and printed its fine",
+      "kind": "file",
+      "verify": "python3 -c \"t=open('TECHNICAL-DISCLOSURE.md',encoding='utf-8').read();S=['8 / 10', 'one-character bash ops', 'printed \\x60its fine\\x60', 'tagged \\x60_doctor_fixed\\x60'];m=[x for x in S if x not in t];[print('found',x) for x in S if x in t];assert not m,m\"",
+      "expect": "found each of the four strings (all present)",
+      "evidence": [
+        "TECHNICAL-DISCLOSURE.md",
+        "DOSSIER.md"
+      ],
+      "runtime_s": 1,
+      "needs": [
+        "python3"
+      ],
+      "what_it_means": "The project's own list of things the repair step gets wrong: a stringified operations array becomes junk one-character commands that still pass validation, and the shell-quote repair can change what a command prints (flagged with _doctor_fixed so it is visible). Passing proves the limitations are written down in the disclosure. It does not mean they are fixed; they are marked 'measured today, not fixed in 0.1.0'.",
+      "how_we_got_it": "TECHNICAL-DISCLOSURE.md section 10 limitations and DOSSIER.md 'Limits', measured 2026-09-29 on the i5-8365U. The probing script is not committed.",
+      "use_in_your_work": "Know where input repair for LLM tool calls goes wrong before you rely on it: always surface repairs to the caller.",
+      "honest_limits": "Status after 0.2.0 of these two items is not stated in the repo.",
+      "cpu_flags": [],
+      "corrections": []
+    },
+    {
+      "id": "T11",
+      "title": "Release hygiene: no secrets, no home paths, no vendored binaries",
+      "claim": "gitleaks 8.30.1 (detect --no-git -s .): no leaks found; home-directory paths of the development machine: 0; vendored third-party binaries/sources: none",
+      "kind": "file",
+      "verify": "python3 -c \"t=open('release-scan.txt',encoding='utf-8').read();S=['gitleaks 8.30.1', 'no leaks found', 'paths of the development machine (grep -rn over the tree): 0', 'Vendored third-party binaries/sources: none'];m=[x for x in S if x not in t];[print('found',x) for x in S if x in t];assert not m,m\"",
+      "expect": "found each of the four strings (all present)",
+      "evidence": [
+        "release-scan.txt",
+        "PROVENANCE.md"
+      ],
+      "runtime_s": 1,
+      "needs": [
+        "python3"
+      ],
+      "what_it_means": "The scan record from the release cut says a secret scanner found nothing, no author-machine paths remain and nothing third-party is bundled (the ONNX runtime, JSON library and BERT model are excluded and listed in PROVENANCE.md). Passing proves the record says so; it is a 2026-09-29 snapshot, not a re-scan.",
+      "how_we_got_it": "release-scan.txt, ScanCode 32.5.0 and gitleaks 8.30.1 on the tree of 2026-09-29. Re-scan with those tools to refresh.",
+      "use_in_your_work": "A template for a release record you can show to a reviewer: scanner versions, date and the exact claim.",
+      "honest_limits": "Snapshot of the 2026-09-29 tree (35 files); later commits are not covered.",
+      "cpu_flags": [],
+      "corrections": []
+    }
+  ]
+}

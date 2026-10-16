@@ -1,8 +1,9 @@
 # tarsus
 
-> Tarsus (formerly *omnitool*) is the "hands" of an agent: one call carries a JSON batch of operations (`bash`, `read`, `write`, `patch`, `sql`, `glob`, `grep`, `fix_json`), which is repaired, validated, safety-checked and executed in parallel, sequentially or in dependency order, and answered with on
+> Safe hands for tool-calling agents: batch tool execution with payload repair, a deterministic safety guard, kernel (Landlock) write confinement, human-only approval, audit trail and an MCP server. Linux only.
 
 Setup: `git clone --depth 1 https://github.com/SovRing-Labs/tarsus && cd tarsus && python3 bin/omnitool_guard.py selftest` (expect: OMNITOOL-GUARD SELFTEST: PASS (62/62)).
+Status: pre-alpha, under development — read STATUS.md before relying on a number.
 Licence: PolyForm Small Business 1.0.0 OR PolyForm Noncommercial 1.0.0 (free trial for evaluation).
 
 ## Docs

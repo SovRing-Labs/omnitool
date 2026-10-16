@@ -2,8 +2,10 @@
 
 For coding assistants (and people) setting this repository up. Plain steps; every command runs from the repo root.
 
+**Status: pre-alpha, under development.** Interfaces, numbers and file layout can change without notice. Read `STATUS.md` first: what works today (each line names its test and evidence file), what is not yet tested, the known failures and the corrections.
+
 ## What it is
-Tarsus (formerly *omnitool*) is the "hands" of an agent: one call carries a JSON batch of operations (`bash`, `read`, `write`, `patch`, `sql`, `glob`, `grep`, `fix_json`), which is repaired, validated, safety-checked and executed in parallel, sequentially or in dependency order, and answered with one structured result per operation. It is built for small, local, tool-calling models that routinely emit malformed payloads: it repairs what it can, refuses what it cannot, never runs half a batch its guard rejected — and since 0.2.0 the kernel itself confines what a bash command can write, and …
+Safe hands for tool-calling agents: batch tool execution with payload repair, a deterministic safety guard, kernel (Landlock) write confinement, human-only approval, audit trail and an MCP server. Linux only.
 
 ## Install and check (3 commands)
 ```bash
@@ -12,11 +14,12 @@ git clone --depth 1 https://github.com/SovRing-Labs/tarsus && cd tarsus
 python3 bin/omnitool_guard.py selftest   # expect: OMNITOOL-GUARD SELFTEST: PASS (62/62)
 ```
 Needs: python3>=3.10.
+Whole suite instead: `bash install.sh --no-gui` (python check → venv → every runnable `suite.json` test, headless; without `--no-gui` it then opens the local results page on 127.0.0.1).
 Measured: 0.4s on a fresh clone (Intel i5-8365U laptop, 2026-10-16, exit 0).
 Full suite: `make test`.
 
 ## What the tests mean
-`suite.json` lists every claim this repository makes with its verify command, the expected output, what passing means, how the number was obtained and how to use it in your own work (being written). `STATUS.md` says what works today, what is not yet tested and the known failures; the umbrella's `STATUS.md` has one row per repository.
+`suite.json` lists every claim this repository makes with its verify command, the expected output, what passing means, how the number was obtained and how to use it in your own work (11 tests, in `suite.json` at the repository root). `STATUS.md` says what works today, what is not yet tested and the known failures; the umbrella's `STATUS.md` has one row per repository.
 
 ## Where the evidence is
 - `DOSSIER.md` — history, metrics and limits

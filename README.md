@@ -1,5 +1,11 @@
 # Tarsus 0.2.0 — safe hands for tool-calling agents
 
+<!-- status-badges (REPO-ACCESS-C) -->
+[![status: pre-alpha (under development)](https://img.shields.io/badge/status-pre--alpha%20%28under%20development%29-orange)](STATUS.md) **Status: pre-alpha, under development** — what works today, what is untested and what failed: [`STATUS.md`](STATUS.md)
+
+[![defensive publication: DOI 10.5281/zenodo.23282013](https://img.shields.io/badge/defensive%20publication-DOI%2010.5281%2Fzenodo.23282013-blue)](https://doi.org/10.5281/zenodo.23282013) **Defensive publication:** [`TECHNICAL-DISCLOSURE.md`](TECHNICAL-DISCLOSURE.md) · DOI [10.5281/zenodo.23282013](https://doi.org/10.5281/zenodo.23282013)
+<!-- /status-badges -->
+
 Tarsus (formerly *omnitool*) is the "hands" of an agent: one call carries a JSON batch of operations (`bash`, `read`,
 `write`, `patch`, `sql`, `glob`, `grep`, `fix_json`), which is repaired, validated, safety-checked and executed in
 parallel, sequentially or in dependency order, and answered with one structured result per operation. It is built

@@ -53,8 +53,9 @@ the stack it is the **hands**. It grew out of the author's fleet, where it is th
 
 ## Tests
 
-`make test`: guard self-test 59/59; pytest 40 passed + 2 skipped (interceptor socket absent); node:test 5/5 (11/11
-with the MCP SDK installed).
+`make test` (re-run 2026-10-16): guard self-test 62/62; pytest 69 passed + 4 skipped (interceptor socket absent; that run
+leaves out `tests/test_classifier.py`, which needs sentence-transformers); node:test 5/5 (11/11 with the MCP SDK installed). Earlier record: guard 59/59,
+pytest 40 passed + 2 skipped.
 
 ## Limits (measured, not fixed in 0.1.0)
 
